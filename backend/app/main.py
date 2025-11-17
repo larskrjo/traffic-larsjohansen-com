@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     # Startup: schedule the job
     scheduler.add_job(
         run_data_gathering,
-        trigger=CronTrigger(day_of_week="fri", hour=23, minute=0),
+        trigger=CronTrigger(day_of_week="mon", hour=10, minute=35),
         id="weekly_commute_data_gathering",
         replace_existing=True,
     )
