@@ -1,7 +1,7 @@
 import sys
 from urllib import request, error
 
-URL = "http://127.0.0.1:8000/health"
+URL = "http://127.0.0.1:8000/healthcheck"
 TIMEOUT = 2
 
 try:
