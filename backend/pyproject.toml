@@ -1,0 +1,42 @@
+[project]
+name = "traffic-larsjohansen-com-backend"
+version = "0.1.0"
+description = "Traffic Lars Johansen Com Backend"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "mysql-connector-python",
+    "requests",
+    "types-requests",
+    "boto3",
+    "botocore",
+    "pandas",
+    "pandas-stubs",
+    "numpy",
+    "matplotlib",
+    "apscheduler"
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false

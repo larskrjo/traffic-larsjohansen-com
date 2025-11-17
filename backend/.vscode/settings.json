@@ -1,0 +1,32 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": null,
+  "workbench.editor.enablePreview": false,
+  "workbench.editor.revealIfOpen": true,
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.formatOnSaveMode": "file"
+  },
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingTypeStubs": "none",
+    "reportMissingImports": "none"
+  },
+  "black-formatter.args": ["--config=pyproject.toml"],
+  "black-formatter.path": ["black"],
+  "files.autoSave": "off",
+  "files.autoSaveDelay": 1000,
+  "files.saveConflictResolution": "overwriteFileOnDisk",
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/**": true
+  },
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.eol": "\n"
+}

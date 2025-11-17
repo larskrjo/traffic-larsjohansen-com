@@ -1,0 +1,42 @@
+:root {
+    font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+    font-weight: 400;
+
+    color-scheme: light dark;
+    color: #213547;
+    background-color: #ffffff;
+
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-width: 100%;
+    min-height: 100dvh;
+}
+
+
+
+.main-error-container {
+    padding: 1rem;          /* p-4 */
+    max-width: 1024px;      /* typical 'container' width */
+    margin-left: auto;      /* mx-auto: center horizontally */
+    margin-right: auto;
+    box-sizing: border-box;
+}
+
+.stack-block {
+    width: 100%;            /* w-full */
+    padding: 1rem;          /* p-4 */
+    overflow-x: auto;       /* overflow-x-auto */
+    background: #f9f9f9;    /* optional: improve readability */
+    border-radius: 0.25rem; /* optional */
+    font-family: monospace;
+}

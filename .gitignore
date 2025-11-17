@@ -1,0 +1,17 @@
+# MacOS
+**/.DS_Store
+
+# JetBrains
+**/.idea/
+
+# Javascript/Typescript
+**/node_modules/
+
+# Python
+**/__pycache__/
+**/*.egg-info/
+**/.venv
+
+# React Router
+**/.react-router/
+**/build/
