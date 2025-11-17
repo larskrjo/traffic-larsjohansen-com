@@ -69,7 +69,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     next_run = job.next_run_time
     logger.info(
-        f"✅ Scheduler started: Data gathering scheduled for Mondays at 10:35 AM Pacific Time"
+        f"✅ Scheduler started: Data gathering scheduled for Fridays at 11:00 PM Pacific Time"
         f" (next run: {next_run.isoformat() if next_run else 'N/A'})"
     )
     yield
