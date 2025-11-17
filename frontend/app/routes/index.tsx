@@ -1,3 +1,4 @@
+import { COMMUTE_HEATMAP_URL } from "~/constants/path";
 import type {Route} from "./+types/index";
 import HeatMap from "~/components/HeatMap";
 
@@ -17,7 +18,7 @@ type HeatmapApiResponse = {
 
 export async function clientLoader() {
     try {
-        const res = await fetch("http://api.traffic.larsjohansen.com:8000/api/commute/heatmap");
+        const res = await fetch(COMMUTE_HEATMAP_URL);
         if (!res.ok) {
             throw new Error(`Failed to fetch: ${res.statusText}`);
         }

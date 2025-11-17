@@ -1,22 +1,13 @@
-#!/usr/bin/env python3
-"""
-FastAPI application to expose commute data as an API.
-Returns data in the same format used for plotting heatmaps.
-"""
+from fastapi import APIRouter
 
 from typing import Dict, Optional
-from contextlib import asynccontextmanager
 import warnings
 import numpy as np
 import pandas as pd  # type: ignore[import]
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
 from mysql.connector import Error  # type: ignore[import-untyped]
-from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped,import]
-from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped,import]
 
 from app.db.db import pool  # type: ignore[import-untyped]
-from app.data_gathering import main as data_gathering_main  # type: ignore[import-untyped]
 
 # Suppress pandas warning about mysql-connector compatibility
 warnings.filterwarnings(
@@ -26,46 +17,7 @@ warnings.filterwarnings(
     module="pandas",
 )
 
-scheduler = AsyncIOScheduler()
-
-
-def run_data_gathering():
-    """Wrapper function to run data gathering (synchronous function)."""
-    try:
-        data_gathering_main()
-    except Exception as e:
-        print(f"❌ Error running data gathering job: {e}")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage scheduler lifecycle."""
-    # Startup: schedule the job
-    scheduler.add_job(
-        run_data_gathering,
-        trigger=CronTrigger(day_of_week="fri", hour=23, minute=0),
-        id="weekly_commute_data_gathering",
-        replace_existing=True,
-    )
-    scheduler.start()
-    print("✅ Scheduler started: Data gathering scheduled for Fridays at 23:00")
-    yield
-    # Shutdown: stop the scheduler
-    scheduler.shutdown()
-    print("✅ Scheduler stopped")
-
-
-app = FastAPI(title="Traffic Commute API", version="1.0.0", lifespan=lifespan)
-
-
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+traffic_router = APIRouter(prefix="/api/v1", tags=["Traffic Commute API"])
 
 
 def parse_duration_minutes(val) -> float:
@@ -183,13 +135,13 @@ def process_commute_data(df: pd.DataFrame) -> Dict[str, Dict]:
     return result
 
 
-@app.get("/")
+@traffic_router.get("/")
 async def root():
     """Root endpoint."""
     return {"message": "Traffic Commute API", "version": "1.0.0"}
 
 
-@app.get("/api/commute/heatmap")
+@traffic_router.get("/commute/heatmap")
 async def get_commute_heatmap_data(
     direction: Optional[str] = None,
 ):
@@ -221,7 +173,7 @@ async def get_commute_heatmap_data(
         raise HTTPException(status_code=500, detail=f"Error processing data: {str(e)}")
 
 
-@app.get("/api/commute/directions")
+@traffic_router.get("/commute/directions")
 async def get_directions():
     """Get list of available directions."""
     try:
@@ -230,9 +182,3 @@ async def get_directions():
         return {"directions": list(result.keys())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
