@@ -32,12 +32,16 @@ async def scheduler_status():
 
     jobs = []
     for job in scheduler.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "name": job.name,
-            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
-            "trigger": str(job.trigger),
-        })
+        jobs.append(
+            {
+                "id": job.id,
+                "name": job.name,
+                "next_run_time": (
+                    job.next_run_time.isoformat() if job.next_run_time else None
+                ),
+                "trigger": str(job.trigger),
+            }
+        )
 
     return {
         "scheduler_running": scheduler.running,
@@ -46,23 +50,3 @@ async def scheduler_status():
         "current_time_pacific": datetime.now(pacific_tz).isoformat(),
         "jobs": jobs,
     }
-
-
-@healthcheck_router.post("/scheduler/trigger")
-async def trigger_data_gathering():
-    """Manually trigger the data gathering job (for testing)."""
-    # Import here to avoid circular import
-    from app.main import scheduler, run_data_gathering  # type: ignore[import-untyped]
-
-    try:
-        # Run the job in a background task
-        import asyncio
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, run_data_gathering)
-        return {
-            "status": "triggered",
-            "message": "Data gathering job has been triggered",
-            "time": datetime.utcnow().isoformat(),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to trigger job: {str(e)}")
