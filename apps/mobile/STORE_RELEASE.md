@@ -2,36 +2,68 @@
 
 This file tracks the human-only parts of shipping **Time2Leave** to
 the App Store and Google Play. Everything else (build config, signing,
-upload) is automated through EAS — see [`eas.json`](eas.json).
+upload, OTA updates) is automated through EAS — see
+[`eas.json`](eas.json).
 
 The bundle ID `com.time2leave.app` is already reserved in
 [`app.config.ts`](app.config.ts) for both platforms; the steps below
 register it on each store and produce a first internal build.
 
+> **Use the `npm run eas` wrapper, not bare `eas`.**
+> The wrapper sources `apps/mobile/.env` before invoking the CLI so
+> every EAS subcommand sees `EXPO_PUBLIC_APP_ENV`, `EXPO_PUBLIC_*`,
+> etc. — without it `app.config.ts` throws "EXPO_PUBLIC_APP_ENV must
+> be set" the moment EAS falls back to its bundled `@expo/config`
+> (which doesn't auto-load `.env`). Every example below uses the
+> wrapper.
+
 ## 1. Reserve the bundle ID
+
+### Apple Developer Portal (one-time, before App Store Connect)
+
+1. Sign in at <https://developer.apple.com/account/resources/identifiers/list>.
+2. **Identifiers → + → App IDs → App** → register `com.time2leave.app`.
+3. On that App ID, enable **Sign In with Apple**. The
+   `expo-apple-authentication` plugin in `app.config.ts` adds the
+   matching entitlement to the binary; the App ID must agree or the
+   provisioning profile fails to issue.
+4. Note your **Team ID** (top-right of the page when signed in, e.g.
+   `TEXR74M723`). Already wired into
+   [`eas.json`](eas.json) → `submit.production.ios.appleTeamId`.
 
 ### App Store Connect
 
-1. Log in to <https://appstoreconnect.apple.com/> with your team's
-   Apple ID.
-2. **Apps → +** → **New App**.
+1. Log in to <https://appstoreconnect.apple.com/> with the Apple ID
+   on `eas.json` → `submit.production.ios.appleId`.
+2. **Apps → + → New App**.
 3. Fill in:
     - Platforms: **iOS**
-    - Name: `Time2Leave`
+    - Name: **NOT bare `Time2Leave`** — that's already reserved by
+      somebody else. Apple's name-uniqueness check is fuzzy,
+      case-insensitive, and includes 180-day reservation holds
+      invisible to public search. Use the `Brand: Tagline` pattern
+      so the name resolves *and* sells in storefront search:
+        - `Time2Leave: Know When to Leave` (preferred — matches
+          the splash headline)
+        - `Time2Leave: Smart Commute`
+        - `Time2Leave: Drive Time Heatmap`
+      The home-screen launcher label stays `Time2Leave` (it's set by
+      `name:` in `app.config.ts`, *not* the App Store listing name).
     - Primary language: English (U.S.)
-    - Bundle ID: **`com.time2leave.app`** (use the dropdown — if it's
-      not there, add it via <https://developer.apple.com/account/resources/identifiers/list>
-      first)
+    - Bundle ID: **`com.time2leave.app`** (dropdown — populated
+      automatically because EAS already registered it when it
+      provisioned your first build's distribution profile).
     - SKU: `time2leave-ios`
 4. Hit Create. Note the **App Store Connect App ID** (10-digit
-   numeric) and put it in `eas.json` under
-   `submit.production.ios.ascAppId`.
+   numeric, e.g. `6766430353` for the current listing); already
+   wired into [`eas.json`](eas.json) → `submit.production.ios.ascAppId`.
 
 ### Google Play Console
 
 1. Log in to <https://play.google.com/console>.
 2. **Create app**:
-    - App name: `Time2Leave`
+    - App name: `Time2Leave` (Google's uniqueness check is much
+      looser than Apple's, so the bare name should work)
     - Default language: English (United States)
     - App or game: App
     - Free or paid: Free
@@ -54,6 +86,14 @@ is to regenerate them after any brand-mark changes:
 ```bash
 npm --prefix apps/mobile run icons
 ```
+
+`sharp` (the rasteriser used by `generate-icons.mjs`) is declared as
+`optionalDependencies` in [`apps/mobile/package.json`](package.json)
+on purpose: the EAS macOS cloud builder can't always resolve sharp's
+prebuilt binaries, but since sharp has no runtime role in the bundle,
+marking it optional lets `npm ci --include=dev` continue on the
+builder if its postinstall fails. Locally, sharp installs fine and the
+icons script keeps working.
 
 Marketing screenshots (uploaded directly in App Store Connect / Play
 Console; not committed to git):
@@ -87,36 +127,134 @@ Google "Data safety" (Play Console → App content → Data safety):
 - App activity → Other actions: collected (saved trip addresses),
   same disclosures as above.
 
-## 4. First build
+App Store Connect also needs a **Privacy Policy URL** under App
+Information; Apple Review will hard-reject without it. Point it at
+`https://time2leave.com/privacy`.
+
+App Store Connect → **Sign-In Information** is required because the
+backend is allowlist-gated. Add an Apple-Review-only allowlist entry
+(e.g. `apple-review@time2leave.com`) via the admin endpoint or
+`AUTH_ALLOWLIST_BOOTSTRAP`, and put credentials for that account in
+this section. Reviewers will sign in with Apple using a test Apple ID
+whose email is on the allowlist.
+
+## 4. EAS environment variables — visibility matters
+
+`apps/mobile/.env` is gitignored and lives only on the developer's
+machine; the EAS cloud builder reads its env from **EAS-managed
+environment variables**, pushed to the `production` environment with:
+
+```bash
+cd apps/mobile
+npm run eas -- env:push production --path .env --force --visibility plaintext
+```
+
+⚠️ **`--visibility plaintext` is mandatory for any `EXPO_PUBLIC_*` var.**
+The default push heuristic marks anything that looks like an API key
+as `SENSITIVE`. Sensitive vars are visible during the build (so
+`app.config.ts` can read them) but **Metro silently drops them when
+inlining `process.env.EXPO_PUBLIC_*` into the JS bundle** — the
+runtime sees `undefined` and `loadEnvOnce()` falls through to the
+SetupRequired screen. We hit this on build #3 (5 May 2026) and had to
+ship an OTA to recover existing installs. Always force `plaintext`.
+
+Confirm visibility after pushing:
+
+```bash
+npm run eas -- env:list production --format long | grep -E 'Name|Visibility'
+```
+
+Every line should read `Visibility    PUBLIC` (the API name for
+"Plain text"). If any are `SENSITIVE`, fix them in the EAS dashboard
+or with `eas env:update`, then **rebuild** — the existing IPA's JS
+bundle already has the wrong (empty) values inlined.
+
+## 5. First build + submit
 
 ```bash
 # One-time:
 npm install -g eas-cli
-eas login
-cd apps/mobile && eas init   # links the local app to its EAS project
+npm run eas -- login
+npm run eas -- init   # links the local app to its EAS project
+                      # (writes extra.eas.projectId in app.config.ts — already there)
 
-# Production builds (cloud — no Mac for Android, no Android SDK for iOS):
-eas build --platform ios --profile production
-eas build --platform android --profile production
+# Production build (cloud — no Mac needed for Android,
+# no Android SDK needed for iOS):
+npm run eas -- build --platform ios --profile production
+npm run eas -- build --platform android --profile production
 ```
 
 EAS handles signing automatically: it'll create / reuse an iOS
 Distribution certificate and provisioning profile, and generate /
-upload an Android upload key.
+upload an Android upload key. The first iOS build also prompts you
+for an Apple Developer account login + 2FA code; sessions are cached
+in `~/.app-store/auth/<apple-id>/` for subsequent builds.
 
-## 5. Submit
+Submit:
 
 ```bash
-eas submit --platform ios --latest      # → TestFlight
-eas submit --platform android --latest  # → Play Internal Testing
+npm run eas -- submit --platform ios --latest      # → TestFlight
+npm run eas -- submit --platform android --latest  # → Play Internal Testing
 ```
 
-Manual rollout from each console after smoke-testing on real devices.
+`--latest` picks up the most recent successful build for that
+platform/profile pair. Processing on App Store Connect takes ~30 min;
+your TestFlight internal tester list (App Store Connect → TestFlight)
+sees the new build once that completes.
 
-## 6. Post-launch
+Smoke-test on real devices before promoting to external testers /
+submitting for App Review:
 
-- Increment `expo.version` in `app.json` per release.
-- `eas build --auto-submit` chains build + submit in one command once
-  you trust the pipeline.
-- Watch <https://expo.dev/accounts/time2leave/projects/time2leave/builds>
-  for build status, logs, and downloadable artifacts.
+- Sign in with Apple → lands on `/trips`
+- Sign in with Google → lands on `/trips`
+- Create a trip → heatmap loads, backfill polls, cells fill in
+- Sign out + sign back in
+- App Privacy: confirm the splash shows no analytics opt-in (we
+  don't ship one, but verify there's nothing leaking).
+
+## 6. Over-the-air updates with EAS Update
+
+`expo-updates` is installed and `runtimeVersion: { policy: "appVersion" }`
+is set in [`app.config.ts`](app.config.ts), so any JS-only fix can
+ship without going through App Store Review. The `production` build
+channel in [`eas.json`](eas.json) maps to the `production` EAS Update
+branch.
+
+```bash
+cd apps/mobile
+npm run eas -- update --channel production --environment production \
+    --platform ios \
+    --message "<one-line summary>"
+```
+
+`--environment production` makes Metro see the same env vars the
+cloud build would. `--platform ios` skips the web export, which
+otherwise errors because we don't ship `react-native-web`.
+
+Existing installs pick up the new bundle on next cold start — the
+default `expo-updates` config downloads in the background on launch
+and applies on the *next* launch (so a single force-quit / reopen
+cycle activates it). New TestFlight or App Store installs always
+start from the IPA's JS bundle until they fetch their first OTA.
+
+**Don't rely on OTAs to fix env-var-missing or other "broken on first
+launch" issues** — the SetupRequired screen above is one such case;
+new installs will see it for one launch before the OTA arrives, which
+is a terrible first-run experience. For env / config changes that
+affect first launch, do a proper `eas build` + `eas submit` cycle.
+
+## 7. Post-launch
+
+- Bump `version` in [`app.config.ts`](app.config.ts) per release.
+  `runtimeVersion.policy = "appVersion"` ties OTA compatibility to
+  this string, so any bump cuts a new OTA branch — only installs
+  built off the matching binary version receive future updates on
+  that channel.
+- `eas build --auto-submit` chains build + submit in one command
+  once you trust the pipeline.
+- Watch <https://expo.dev/accounts/larskrjo/projects/time2leave>
+  for build status, OTA history, logs, and downloadable artifacts.
+- Sign-In Information in App Store Connect needs a working
+  test account on the backend allowlist — Apple Review uses it on
+  every resubmission, not just the first. Don't remove that
+  allowlist entry.
