@@ -59,14 +59,31 @@ export type EnvLoadResult =
     | { ok: true; env: Env }
     | { ok: false; appEnv: AppEnv | "unset"; missing: MissingVar[] };
 
+/**
+ * Validate one already-resolved env value.
+ *
+ * ⚠️ This intentionally does NOT do `process.env[name]` itself —
+ * Metro's `EXPO_PUBLIC_*` inlining only fires for **static** property
+ * accesses (`process.env.EXPO_PUBLIC_FOO`), not dynamic ones
+ * (`process.env[name]`). If we read the env var here, every callsite
+ * would compile down to a dynamic lookup that's always `undefined` in
+ * a production JS bundle — which is exactly the bug we shipped in
+ * builds #3–#4 on 5 May / 20 May 2026 (`EXPO_PUBLIC_APP_ENV` worked
+ * because it was the only static read; the four other vars all
+ * routed through here and disappeared from the bundle).
+ *
+ * The fix is to keep every `process.env.EXPO_PUBLIC_X` access at the
+ * loadEnv() callsite (one literal per var) and pass the already-read
+ * value into this helper.
+ */
 function readRequired(
     name: string,
+    value: string | undefined,
     description: string,
     example: string,
     missing: MissingVar[],
 ): string {
-    const raw = process.env[name];
-    const trimmed = raw?.trim() ?? "";
+    const trimmed = value?.trim() ?? "";
     if (trimmed.length === 0) {
         missing.push({ name, description, example });
         return "";
@@ -76,6 +93,13 @@ function readRequired(
 
 export function loadEnv(): EnvLoadResult {
     const missing: MissingVar[] = [];
+
+    // Every `process.env.EXPO_PUBLIC_*` below MUST stay as a literal
+    // static property access — see `readRequired`'s docstring. If you
+    // refactor any of these to a helper that takes a name string and
+    // does `process.env[name]`, the value will silently disappear
+    // from the production JS bundle and `loadEnv()` will fall through
+    // to the SetupRequired screen on every install.
 
     const rawAppEnv = process.env.EXPO_PUBLIC_APP_ENV?.trim();
     if (rawAppEnv !== "local" && rawAppEnv !== "prod") {
@@ -96,6 +120,7 @@ export function loadEnv(): EnvLoadResult {
 
     const apiBaseUrl = readRequired(
         "EXPO_PUBLIC_API_BASE_URL",
+        process.env.EXPO_PUBLIC_API_BASE_URL,
         "Root URL of the FastAPI backend. For dev on a real phone this MUST be your laptop's LAN IP (find it with `ipconfig getifaddr en0`) — `localhost` from the phone means the phone itself.",
         appEnv === "local"
             ? "http://192.168.1.42:8000"
@@ -104,6 +129,7 @@ export function loadEnv(): EnvLoadResult {
     );
     const googleMapsApiKey = readRequired(
         "EXPO_PUBLIC_GOOGLE_MAPS_API_KEY",
+        process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY,
         "Google Maps Platform key with the Places API enabled. Powers the address autocomplete on the new-trip form.",
         "AIzaSyA...rest-of-key",
         missing,
@@ -112,6 +138,7 @@ export function loadEnv(): EnvLoadResult {
     if (appEnv === "local") {
         const devLoginEmail = readRequired(
             "EXPO_PUBLIC_DEV_LOGIN_EMAIL",
+            process.env.EXPO_PUBLIC_DEV_LOGIN_EMAIL,
             "Email used by POST /api/v1/auth/dev-login on the backend. Must be on the backend's auth allowlist (see backend AUTH_ALLOWLIST_BOOTSTRAP / ADMIN_EMAILS).",
             "dev@example.com",
             missing,
@@ -127,12 +154,14 @@ export function loadEnv(): EnvLoadResult {
 
     const googleOAuthWebClientId = readRequired(
         "EXPO_PUBLIC_GOOGLE_OAUTH_WEB_CLIENT_ID",
+        process.env.EXPO_PUBLIC_GOOGLE_OAUTH_WEB_CLIENT_ID,
         'Web OAuth client ID from Google Cloud Console. @react-native-google-signin requires the *web* client ID as the `webClientId` arg even on iOS — that\'s what becomes the `aud` claim of the ID token, which the backend matches against its `GOOGLE_OAUTH_CLIENT_ID` list.',
         "123456789-abc.apps.googleusercontent.com",
         missing,
     );
     const googleOAuthIosClientId = readRequired(
         "EXPO_PUBLIC_GOOGLE_OAUTH_IOS_CLIENT_ID",
+        process.env.EXPO_PUBLIC_GOOGLE_OAUTH_IOS_CLIENT_ID,
         "iOS OAuth client ID (bundle ID `com.time2leave.app`). app.config.ts auto-derives the iOS URL scheme from this and registers it with the @react-native-google-signin config plugin.",
         "123456789-xyz.apps.googleusercontent.com",
         missing,

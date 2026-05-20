@@ -138,7 +138,7 @@ backend is allowlist-gated. Add an Apple-Review-only allowlist entry
 this section. Reviewers will sign in with Apple using a test Apple ID
 whose email is on the allowlist.
 
-## 4. EAS environment variables — visibility matters
+## 4. EAS environment variables
 
 `apps/mobile/.env` is gitignored and lives only on the developer's
 machine; the EAS cloud builder reads its env from **EAS-managed
@@ -146,28 +146,56 @@ environment variables**, pushed to the `production` environment with:
 
 ```bash
 cd apps/mobile
-npm run eas -- env:push production --path .env --force --visibility plaintext
+npm run eas -- env:push production --path .env --force
 ```
 
-⚠️ **`--visibility plaintext` is mandatory for any `EXPO_PUBLIC_*` var.**
-The default push heuristic marks anything that looks like an API key
-as `SENSITIVE`. Sensitive vars are visible during the build (so
-`app.config.ts` can read them) but **Metro silently drops them when
-inlining `process.env.EXPO_PUBLIC_*` into the JS bundle** — the
-runtime sees `undefined` and `loadEnvOnce()` falls through to the
-SetupRequired screen. We hit this on build #3 (5 May 2026) and had to
-ship an OTA to recover existing installs. Always force `plaintext`.
-
-Confirm visibility after pushing:
+Confirm what's stored after pushing:
 
 ```bash
-npm run eas -- env:list production --format long | grep -E 'Name|Visibility'
+npm run eas -- env:list production
 ```
 
-Every line should read `Visibility    PUBLIC` (the API name for
-"Plain text"). If any are `SENSITIVE`, fix them in the EAS dashboard
-or with `eas env:update`, then **rebuild** — the existing IPA's JS
-bundle already has the wrong (empty) values inlined.
+All five `EXPO_PUBLIC_*` vars from
+[`src/config/env.ts`](src/config/env.ts) (in `prod` mode) must be
+present:
+
+- `EXPO_PUBLIC_APP_ENV` — `prod`
+- `EXPO_PUBLIC_API_BASE_URL`
+- `EXPO_PUBLIC_GOOGLE_MAPS_API_KEY`
+- `EXPO_PUBLIC_GOOGLE_OAUTH_WEB_CLIENT_ID`
+- `EXPO_PUBLIC_GOOGLE_OAUTH_IOS_CLIENT_ID`
+
+### ⚠️ Metro only inlines `process.env.EXPO_PUBLIC_*` for STATIC accesses
+
+This is the trap that ate builds #3 and #4 on 5 May / 20 May 2026 and
+took two OTAs to fully recover from:
+
+```ts
+// ✅ STATIC — Metro replaces this with the inlined value at bundle time.
+const url = process.env.EXPO_PUBLIC_API_BASE_URL;
+
+// ❌ DYNAMIC — Metro sees `process.env[name]` and leaves it alone,
+// because it can't tell what `name` resolves to at bundle time. The
+// runtime evaluates `process.env[name]` in an empty `process.env`
+// object and gets `undefined` regardless of what was set on the EAS
+// builder.
+function readEnv(name: string) {
+    return process.env[name];
+}
+```
+
+If you refactor [`src/config/env.ts`](src/config/env.ts), **every
+`process.env.EXPO_PUBLIC_*` access must remain a literal at the
+callsite**. The current loader (`loadEnv()`) reads each var with a
+static literal and passes the value into a helper for validation —
+do not "DRY this up" by hoisting the property access into a function
+that takes the name as a parameter. There's a comment in `env.ts`
+explaining this; preserve it.
+
+Symptom when this regresses: the SetupRequired screen lists every
+var *except* the one(s) you happen to read statically (we kept
+`EXPO_PUBLIC_APP_ENV` working long after the rest broke because that
+single var was read statically in `loadEnv()`'s first line).
 
 ## 5. First build + submit
 

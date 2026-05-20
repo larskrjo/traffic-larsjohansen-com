@@ -10,6 +10,7 @@ android/
 # Expo
 .expo/
 dist/
+dist-*/
 web-build/
 
 # Native
