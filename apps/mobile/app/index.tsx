@@ -50,12 +50,23 @@ export default function Splash() {
     const { status, signInDev } = useAuth();
     const env = requireEnv();
 
-    // The only sign-in error we ever surface: the backend's 403
-    // when an authenticated user isn't on the invite allowlist.
-    // Cancellations / network blips / provider errors all dismiss
-    // silently inside the buttons themselves — see comments in
+    // Tri-state sign-in feedback. The two error states map 1:1 to
+    // the two callbacks each provider button exposes — see
     // {Apple,Google}SignInButton.tsx for the full UX rule.
-    const [allowlistRejected, setAllowlistRejected] = useState(false);
+    //   "none"       -> default invite-only disclaimer.
+    //   "allowlist"  -> backend 403: provider authenticated the user
+    //                   but the email isn't on the invite list.
+    //   "unexpected" -> any other backend/network/provider failure
+    //                   (401, 5xx, offline, missing Play services,
+    //                   ERR_REQUEST_FAILED, ...). We don't drill
+    //                   into the cause for the user — they'd just
+    //                   see noise — but we *do* tell them the
+    //                   attempt failed instead of silently
+    //                   dismissing, which is what masked the prod
+    //                   `apple_sub` schema-drift outage in TestFlight.
+    // User cancels stay silent inside the buttons themselves.
+    type SignInError = "none" | "allowlist" | "unexpected";
+    const [signInError, setSignInError] = useState<SignInError>("none");
 
     if (status === "loading") return <Loading label="Restoring session…" />;
     if (status === "authenticated") return <Redirect href="/trips" />;
@@ -125,22 +136,24 @@ export default function Splash() {
                                 where Google remains the only path. */}
                             <AppleSignInButton
                                 style={CTA_BUTTON_STYLE}
-                                onAttemptStart={() =>
-                                    setAllowlistRejected(false)
-                                }
+                                onAttemptStart={() => setSignInError("none")}
                                 onAllowlistRejected={() =>
-                                    setAllowlistRejected(true)
+                                    setSignInError("allowlist")
+                                }
+                                onUnexpectedError={() =>
+                                    setSignInError("unexpected")
                                 }
                             />
                             <GoogleSignInButton
                                 style={CTA_BUTTON_STYLE}
                                 contentStyle={CTA_BUTTON_CONTENT_STYLE}
                                 labelStyle={CTA_BUTTON_LABEL_STYLE}
-                                onAttemptStart={() =>
-                                    setAllowlistRejected(false)
-                                }
+                                onAttemptStart={() => setSignInError("none")}
                                 onAllowlistRejected={() =>
-                                    setAllowlistRejected(true)
+                                    setSignInError("allowlist")
+                                }
+                                onUnexpectedError={() =>
+                                    setSignInError("unexpected")
                                 }
                             />
                         </>
@@ -175,13 +188,12 @@ export default function Splash() {
                     )}
 
                     {/* Subtext slot under the CTAs: defaults to the
-                        invite-only disclaimer; swaps to an
-                        error-tinted message when the backend
-                        rejected the user post-provider-auth. The
-                        error replaces (rather than stacks with) the
-                        disclaimer so the user reads exactly one
-                        thing at a time. */}
-                    {allowlistRejected ? (
+                        invite-only disclaimer; swaps to a tinted
+                        error message when the provider button
+                        signalled a failure. Each branch is a single
+                        line so the user reads exactly one thing at
+                        a time. */}
+                    {signInError === "allowlist" ? (
                         <Text
                             variant="bodySmall"
                             style={{
@@ -194,6 +206,20 @@ export default function Splash() {
                         >
                             You're not on the invite list. Ask the owner
                             to add you and try again.
+                        </Text>
+                    ) : signInError === "unexpected" ? (
+                        <Text
+                            variant="bodySmall"
+                            style={{
+                                color: theme.colors.error,
+                                textAlign: "center",
+                                paddingHorizontal: 8,
+                                fontWeight: "600",
+                            }}
+                            accessibilityLiveRegion="polite"
+                        >
+                            Couldn't sign in. Check your connection and
+                            try again.
                         </Text>
                     ) : (
                         <Text

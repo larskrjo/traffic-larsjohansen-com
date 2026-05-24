@@ -320,17 +320,32 @@ key, the Google OAuth client id, and `session_secret`.
 #### Schema is auto-applied
 
 At app startup, `lifespan()` runs
-[`app/db/schema_bootstrap.py`](backend/app/db/schema_bootstrap.py), which
-opens a connection scoped to `MYSQL_DATABASE` and executes the table
-DDL from `db/init/001_schema.sql`. Every `CREATE TABLE` uses
-`IF NOT EXISTS`, so the effect is:
+[`app/db/schema_bootstrap.py`](backend/app/db/schema_bootstrap.py),
+which opens a connection scoped to `MYSQL_DATABASE` and then:
 
-- Brand-new (but pre-created) DB — the app creates all tables on first
-  boot.
-- Existing DB: startup is a no-op beyond a handful of cheap checks.
-- Adding a new table to the schema file: the next deploy creates it.
-  (Column changes to existing tables still require a proper migration —
-  `CREATE TABLE IF NOT EXISTS` won't `ALTER` anything.)
+1. Executes the table DDL from `db/init/001_schema.sql`. Every
+   `CREATE TABLE` uses `IF NOT EXISTS`, so on an existing DB this is
+   a no-op beyond a handful of cheap checks. New tables added to
+   `001_schema.sql` get created on the next deploy automatically.
+2. Runs [`app/db/migrations.py`](backend/app/db/migrations.py),
+   which applies any new `NNNN_*.sql` files in
+   [`backend/db/migrations/`](backend/db/migrations/) and records
+   the applied filename in a `schema_migrations` tracking table so
+   each migration runs exactly once. Errors that mean "already
+   applied" (duplicate column / index, missing drop target) are
+   swallowed — every other DDL error is propagated and the
+   migration is *not* recorded, so a broken migration fails the
+   deploy loudly instead of silently leaving prod half-migrated.
+
+**Rule of thumb: any change to an existing table's structure (add /
+drop column, change nullability, add unique index, …) must ship as
+*both* a new `NNNN_*.sql` migration *and* the matching edit to
+`001_schema.sql`** so a fresh install and an upgraded install both
+end up with identical shapes. The migration files are the source of
+truth for "what changed since the last deploy"; `001_schema.sql` is
+the source of truth for "what shape we'd build from scratch today".
+See [`.cursor/rules/db-schema-via-migrations.mdc`](.cursor/rules/db-schema-via-migrations.mdc)
+for the exact workflow.
 
 **Contract: the database itself must already exist.** `CREATE DATABASE`
 and `USE` lines in the schema file are stripped before execution, so

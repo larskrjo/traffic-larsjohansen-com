@@ -114,10 +114,22 @@ def verify_apple_identity_token(
 
     try:
         signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
-    except (jwt.PyJWKClientError, requests.RequestException) as exc:
-        logger.info("Failed to fetch Apple JWK: %s", exc)
+    except (
+        # `get_signing_key_from_jwt` first parses the JWT header to read
+        # the `kid`, which raises `jwt.DecodeError` (a `PyJWTError`
+        # subclass) for malformed-shape tokens. Without this catch the
+        # endpoint 500s on any client that POSTs garbage instead of a
+        # JWT — which masks real server bugs and gives the mobile
+        # button no chance to render a "try again" message. PyJWKClientError
+        # covers JWK-server / cache issues; RequestException covers
+        # transport failures during the JWK fetch.
+        jwt.PyJWTError,
+        jwt.PyJWKClientError,
+        requests.RequestException,
+    ) as exc:
+        logger.info("Failed to validate Apple token / fetch JWK: %s", exc)
         raise InvalidAppleIdentityTokenError(
-            "Could not retrieve Apple signing key"
+            "Could not validate Apple identity token"
         ) from exc
 
     try:

@@ -36,7 +36,10 @@ import {
     type ViewStyle,
 } from "react-native";
 import { Icon, useTheme } from "react-native-paper";
-import { GoogleSignin } from "@react-native-google-signin/google-signin";
+import {
+    GoogleSignin,
+    statusCodes,
+} from "@react-native-google-signin/google-signin";
 
 import { isApiError } from "@time2leave/shared";
 
@@ -59,11 +62,23 @@ type Props = {
     /**
      * Fired only when the backend returns 403 from `/auth/google` —
      * i.e. Google authenticated the user but the email isn't on
-     * the invite allowlist. The splash converts this into a visible
-     * banner; every other failure dismisses silently to match
-     * native UX (no red banners, no error detail leaks).
+     * the invite allowlist. The splash converts this into a "you're
+     * not on the invite list" banner.
      */
     onAllowlistRejected?: () => void;
+    /**
+     * Fired for every *non-cancel* failure that isn't a 403:
+     *   - the backend returned 401 (invalid token) or 5xx (transient
+     *     server/DB error — historically e.g. the `apple_sub`
+     *     schema-drift bug that 500-ed every TestFlight sign-in),
+     *   - the network request itself failed,
+     *   - Google Play services are missing / out-of-date,
+     *   - or Google completed but handed us no `idToken`.
+     * The splash converts this into a generic "couldn't sign in,
+     * try again" banner. User cancels (`SIGN_IN_CANCELLED`) are
+     * still dismissed silently — same UX as Google's own apps.
+     */
+    onUnexpectedError?: () => void;
 };
 
 let configured = false;
@@ -97,6 +112,7 @@ export function GoogleSignInButton({
     labelStyle,
     onAttemptStart,
     onAllowlistRejected,
+    onUnexpectedError,
 }: Props = {}) {
     const theme = useTheme();
     const isDark = theme.dark;
@@ -132,27 +148,37 @@ export function GoogleSignInButton({
                 (result as { idToken?: string | null }).idToken ??
                 null;
             if (!idToken) {
-                // Don't surface this — same UX rule as cancel: a
-                // failed sign-in dismisses silently and the user can
-                // tap the button again. Logged for our own debugging.
+                // Google's sheet closed without giving us a token —
+                // a configuration bug (wrong webClientId, missing
+                // SHA-1 fingerprint on Android, etc.) rather than a
+                // user choice. Treat as an unexpected failure so
+                // the splash surfaces a "try again" banner.
                 console.warn(
                     "GoogleSignInButton: no ID token returned — check OAuth client configuration for this platform.",
                 );
+                onUnexpectedError?.();
                 return;
             }
             await signInWithGoogle(idToken);
         } catch (err: unknown) {
-            // The one error worth surfacing: backend 403 from
-            // `/auth/google`, which only happens when Google
-            // authenticated the user but the email isn't on the
-            // invite allowlist. Anything else (cancel, network
-            // blip, malformed token, provider error) dismisses
-            // silently — Apple's own Sign In sheet and Google's
-            // first-party apps do the same: the sheet just closes,
-            // no red banner, no technical detail leak. The user
-            // retries by tapping the button. Logged either way.
-            if (isApiError(err) && err.status === 403) {
+            // Three buckets, in order of specificity:
+            //   1. user cancelled the Google sheet -> silent (no
+            //      banner, no log noise; the user explicitly opted
+            //      out of signing in),
+            //   2. backend allowlist rejection (HTTP 403) -> "you're
+            //      not on the invite list" banner,
+            //   3. anything else (network error, 401 invalid token,
+            //      5xx server error, missing Play services) ->
+            //      generic "couldn't sign in, try again" banner.
+            //      Silently dropping these was the bug that masked
+            //      the prod `apple_sub` schema-drift outage that
+            //      500-ed every TestFlight sign-in for hours.
+            if (isGoogleCancelError(err)) {
+                // Silent on cancel — same UX as Google's own apps.
+            } else if (isApiError(err) && err.status === 403) {
                 onAllowlistRejected?.();
+            } else {
+                onUnexpectedError?.();
             }
             console.warn("GoogleSignInButton: sign-in failed", err);
         } finally {
@@ -248,5 +274,22 @@ export function GoogleSignInButton({
                 </View>
             </Pressable>
         </View>
+    );
+}
+
+/**
+ * `@react-native-google-signin/google-signin` surfaces user cancellation
+ * by throwing an error whose `code` matches
+ * `statusCodes.SIGN_IN_CANCELLED`. The actual string value is platform-
+ * dependent (it comes from the native module's `getConstants()`), so
+ * we never hard-code it — always compare against the imported
+ * constant.
+ */
+function isGoogleCancelError(err: unknown): boolean {
+    return (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code?: unknown }).code === statusCodes.SIGN_IN_CANCELLED
     );
 }

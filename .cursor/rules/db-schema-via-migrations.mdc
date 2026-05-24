@@ -1,0 +1,102 @@
+---
+description: Every database schema change must ship as a migration file — never as a 001_schema.sql edit alone
+alwaysApply: true
+---
+
+# Schema changes go through `backend/db/migrations/`
+
+`backend/app/db/schema_bootstrap.py` only runs `CREATE TABLE IF NOT
+EXISTS` against the existing database — that **does nothing to a
+table that already exists**. As a result, simply editing
+`backend/db/init/001_schema.sql` and redeploying produces a deploy
+that "looks the same as local" only on a brand-new database. On the
+existing prod database (or any dev DB that wasn't wiped), the new
+columns / indexes / constraints silently never land, and the next
+runtime query against them blows up with `Unknown column …` 500s.
+
+We hit this exact bug on 24 May 2026: `users.apple_sub` was added
+to `001_schema.sql` for Sign in with Apple but never reached prod,
+and `/auth/google` + `/auth/apple` both started returning 500.
+
+To prevent recurrence, **every schema change ships as two coordinated
+edits in the same PR**:
+
+## ✅ The required workflow
+
+1. **Add a migration file under `backend/db/migrations/`**
+
+   Filename pattern: `NNNN_short_snake_case.sql`, where `NNNN` is a
+   monotonically-increasing 4-digit version (find the next one with
+   `ls backend/db/migrations/ | tail -1`).
+
+   ```sql
+   -- backend/db/migrations/0007_add_foo_to_bar.sql
+   ALTER TABLE bar ADD COLUMN foo varchar(255) DEFAULT NULL;
+   ALTER TABLE bar ADD UNIQUE KEY uniq_bar_foo (foo);
+   ```
+
+   - **One DDL operation per `ALTER` statement.** The runner runs
+     statements one at a time and swallows MySQL errors 1060
+     (column already exists), 1061 (index already exists), and 1091
+     (DROP target missing) so a fresh install whose
+     `001_schema.sql` already produced the post-migration state
+     still records the migration as applied. If you batch
+     `MODIFY …, ADD COLUMN …, ADD KEY …` into one ALTER, a partial-
+     overlap state aborts the whole statement and leaves the schema
+     half-migrated.
+   - **No data backfills in `.sql` files.** Migrations that need to
+     populate computed values still belong here in spirit, but
+     route the backfill through Python (see
+     `_ensure_trips_slug_column` for the existing pattern). Future
+     work may extend the runner to support `.py` migrations.
+
+2. **Update `backend/db/init/001_schema.sql` to the same target state**
+
+   Brand-new installs (dev `docker-compose down -v`, fresh prod
+   spin-up) run `001_schema.sql` once before the migration runner
+   sees the DB. Keeping `001_schema.sql` in lock-step with the
+   migrations means new installs land at the current schema in a
+   single shot — the runner then no-ops the migration via the 1060 /
+   1061 error swallow.
+
+   If a migration would be hard to compose into `001_schema.sql`
+   (e.g., backfilling existing data), still update `001_schema.sql`
+   to the post-migration *shape* — the backfill is unnecessary on a
+   fresh install because there's no existing data to migrate.
+
+## ❌ What's forbidden
+
+- **Editing `001_schema.sql` without a corresponding migration.**
+  This is the bug the rule exists to prevent. The local dev DB will
+  look fine (its volume gets wiped occasionally), prod will silently
+  drift, and the first runtime query against the new column 500s.
+- **`DROP TABLE` / destructive deletes in migrations.** Use a
+  separate, very-deliberate "removal" PR with the operator-approved
+  data dump captured first.
+- **Renaming an applied migration file.** Once `0007_foo.sql` has
+  been applied anywhere, its filename becomes the primary key in
+  `schema_migrations`. Renaming it makes the runner think it's a
+  new migration and try to re-apply (which works because of the
+  1060 / 1061 swallow, but pollutes the audit log). If you need to
+  fix the description, add a follow-up migration.
+
+## Operational notes
+
+- The migration runner is invoked from `ensure_schema()` on every
+  backend boot, after `001_schema.sql` is applied. So a normal
+  `t2l deploy be` is enough to roll out schema changes — there's no
+  separate "apply migrations" step.
+- The runner is idempotent: running it twice in a row does nothing
+  on the second pass.
+- `schema_migrations` rows track the migration version (the
+  filename stem) and the timestamp it was applied. Query it on the
+  EC2 host to audit what's been applied where.
+
+## When in doubt
+
+If you're touching anything that would change `DESCRIBE <table>` /
+`SHOW INDEX FROM <table>` output, you need a migration. If you're
+only adding a CREATE TABLE for a *brand-new* table, you can either
+add a migration or rely on `001_schema.sql` (because `CREATE TABLE
+IF NOT EXISTS` works fine for adds) — but the migration is still
+preferred for the audit trail.

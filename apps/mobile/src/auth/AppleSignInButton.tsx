@@ -48,11 +48,26 @@ type Props = {
     /**
      * Fired only when the backend returns 403 from `/auth/apple` —
      * i.e. Apple authenticated the user but the email isn't on the
-     * invite allowlist. The splash converts this into a visible
-     * banner; every other failure (cancel, network, malformed token,
-     * provider error) is dismissed silently to match native UX.
+     * invite allowlist. The splash converts this into a "you're
+     * not on the invite list" banner.
      */
     onAllowlistRejected?: () => void;
+    /**
+     * Fired for every *non-cancel* failure that isn't a 403:
+     *   - the backend returned 401 (invalid token) or 5xx (transient
+     *     server/DB error — historically e.g. the `apple_sub`
+     *     schema-drift bug that 500-ed every TestFlight sign-in),
+     *   - the network request itself failed (airplane mode, captive
+     *     portal, AWS hiccup),
+     *   - Apple's framework returned a non-cancel error
+     *     (`ERR_REQUEST_FAILED`, `ERR_REQUEST_UNKNOWN`, etc.),
+     *   - or Apple completed but handed us no `identityToken` (App
+     *     ID misconfiguration).
+     * The splash converts this into a generic "couldn't sign in,
+     * try again" banner. User cancels (`ERR_REQUEST_CANCELED`) are
+     * still dismissed silently — same UX as the system sheet.
+     */
+    onUnexpectedError?: () => void;
 };
 
 export function AppleSignInButton({
@@ -60,6 +75,7 @@ export function AppleSignInButton({
     height = 52,
     onAttemptStart,
     onAllowlistRejected,
+    onUnexpectedError,
 }: Props) {
     const theme = useTheme();
     const { signInWithApple } = useAuth();
@@ -86,13 +102,16 @@ export function AppleSignInButton({
             });
 
             if (!credential.identityToken) {
-                // Same UX rule as the Google button: silent on every
-                // failure, including "Apple didn't return a token"
-                // (which would only happen if the entitlement / App
-                // ID config is wrong). Logged for our diagnostics.
+                // Apple completed the sheet but returned no token —
+                // a configuration bug (Sign-in-with-Apple capability
+                // missing from the App ID, primary App ID not set,
+                // etc.). Treat as an unexpected failure so the
+                // splash banner tells the user *something* went
+                // wrong instead of silently dismissing.
                 console.warn(
                     "AppleSignInButton: no identity token returned — check 'Sign in with Apple' is enabled on the App ID at developer.apple.com.",
                 );
+                onUnexpectedError?.();
                 return;
             }
 
@@ -117,16 +136,24 @@ export function AppleSignInButton({
                 fullName && fullName.length > 0 ? fullName : null,
             );
         } catch (err: unknown) {
-            // The one error worth surfacing: backend 403 from
-            // `/auth/apple`, which only happens when the user
-            // authenticated successfully with Apple but isn't on
-            // the invite allowlist. Anything else (cancellations,
-            // network blips, malformed tokens, provider errors)
-            // dismisses silently — same UX rule as native iOS
-            // sign-in flows. The user retries by tapping the
-            // button. Logged for dev visibility either way.
-            if (isApiError(err) && err.status === 403) {
+            // Three buckets, in order of specificity:
+            //   1. user cancelled the Apple sheet -> silent (no
+            //      banner, no log noise; the user explicitly opted
+            //      out of signing in),
+            //   2. backend allowlist rejection (HTTP 403) -> "you're
+            //      not on the invite list" banner,
+            //   3. anything else (network error, 401 invalid token,
+            //      5xx server error, ERR_REQUEST_FAILED / UNKNOWN
+            //      from Apple's framework) -> generic "couldn't
+            //      sign in, try again" banner. Silently dropping
+            //      these was the bug that masked the prod
+            //      `apple_sub` schema-drift outage for hours.
+            if (isAppleCancelError(err)) {
+                // Silent on cancel — same UX as the system sheet.
+            } else if (isApiError(err) && err.status === 403) {
                 onAllowlistRejected?.();
+            } else {
+                onUnexpectedError?.();
             }
             console.warn("AppleSignInButton: sign-in failed", err);
         } finally {
@@ -169,5 +196,23 @@ export function AppleSignInButton({
                 }}
             />
         </View>
+    );
+}
+
+/**
+ * AuthenticationServices.framework reports user cancellation by
+ * throwing an error whose `code` is the string `"ERR_REQUEST_CANCELED"`
+ * (documented at
+ * https://docs.expo.dev/versions/latest/sdk/apple-authentication/#error-codes).
+ * Distinguish it cleanly from "real" failures so cancels stay silent
+ * while everything else (`ERR_REQUEST_FAILED`, `ERR_REQUEST_UNKNOWN`,
+ * etc.) surfaces as a "try again" banner.
+ */
+function isAppleCancelError(err: unknown): boolean {
+    return (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code?: unknown }).code === "ERR_REQUEST_CANCELED"
     );
 }

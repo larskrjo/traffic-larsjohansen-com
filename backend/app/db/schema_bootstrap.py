@@ -36,6 +36,7 @@ import mysql.connector
 from mysql.connector import Error as MySQLError
 
 from app.config import Settings, get_settings
+from app.db.migrations import apply_pending_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,14 @@ def ensure_schema(settings: Settings | None = None) -> None:
             for stmt in statements:
                 cursor.execute(stmt)
             _ensure_trips_slug_column(cursor)
+            # Apply any pending file-based migrations (see
+            # `backend/db/migrations/` and the workflow rule in
+            # `.cursor/rules/db-schema-via-migrations.mdc`). This is
+            # what makes schema additions safe to deploy: any
+            # ALTER recorded in a migration file gets applied
+            # exactly once on each database that doesn't already
+            # have the change.
+            apply_pending_migrations(cursor)
         finally:
             cursor.close()
     finally:
