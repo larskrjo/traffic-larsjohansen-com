@@ -83,11 +83,16 @@ ${BOLD}Local — start / restart with latest local code${RESET}
 ${BOLD}Remote — deploy to production${RESET}
   ${BOLD}deploy be${RESET}          Build + push backend on the EC2 host (SSH in, git pull, docker
                      build, docker compose up).
-                     ${DIM}--host <user@host>${RESET}   Override SSH target.
-                                       Default: \$T2L_EC2_HOST or "time2leave".
+                     ${DIM}--host <user@host>${RESET}   Override SSH target for this invocation.
+                                       Default: \$T2L_EC2_HOST or "time2leave"
+                                       (which must be a ~/.ssh/config alias —
+                                       first run will print setup instructions
+                                       if neither is configured).
   ${BOLD}deploy fe${RESET}          Build apps/web, sync to S3, invalidate CloudFront. Runs locally;
                      needs Node 20+ and AWS creds for bucket time2leave-frontend.
-  ${BOLD}deploy app${RESET}         Mobile app distribution. Exactly one of:
+  ${BOLD}deploy app${RESET}         Mobile app distribution. Run bare on a TTY and t2l walks you
+                     through mode → platform → (for builds) just-build-or-also-
+                     submit. Pass the flags below to skip the prompts.
                      ${DIM}--ota${RESET}      EAS Update (OTA, JS-only). Existing installs pick this up on
                                 next cold start. Use for fixes that don't touch native code.
                                   ${DIM}--message "<msg>"${RESET}   Required-ish release note.
@@ -95,8 +100,10 @@ ${BOLD}Remote — deploy to production${RESET}
                      ${DIM}--build${RESET}    Full native EAS build (production profile, cloud, signs
                                 automatically).
                                   ${DIM}--platform ios|android|both${RESET}   Default: both.
-                                  ${DIM}--submit${RESET}   After build, submit the latest build to
-                                              TestFlight / Play Internal.
+                                  ${DIM}--submit${RESET}   After build, upload to TestFlight (iOS) /
+                                              Play Internal Testing (Android). Does NOT release
+                                              to the public App Store / Play production —
+                                              promote manually in ASC / Play Console.
 
 ${BOLD}Misc${RESET}
   ${BOLD}help${RESET}, --help, -h     Show this message.
@@ -116,7 +123,9 @@ ${BOLD}Examples:${RESET}
 
 ${BOLD}Environment:${RESET}
   T2L_EC2_HOST       SSH target for 'deploy be'. Either a ~/.ssh/config alias
-                     ('time2leave') or 'ec2-user@<ip>'. Default: 'time2leave'.
+                     ('time2leave') or 'ec2-user@<ip-or-dns>'. Default:
+                     'time2leave' — run 'deploy be' once to see the one-time
+                     ~/.ssh/config setup if you haven't done it.
 EOF
 }
 
@@ -182,6 +191,52 @@ cmd_up_ios() {
 }
 
 # ----------------------------------------------------------------------
+# Print actionable one-time setup instructions for the EC2 SSH alias
+# and bail. Called only when we've detected that `ssh $host` would
+# fail with "Could not resolve hostname …". Everything in here is
+# copy-paste runnable.
+# ----------------------------------------------------------------------
+ssh_setup_help() {
+    local host="$1"
+    fail "deploy be: ssh host '$host' isn't resolvable yet."
+    cat >&2 <<HELP
+
+  ${BOLD}One-time setup.${RESET} Pick one of:
+
+  ${BOLD}1) Add a ~/.ssh/config alias${RESET} (recommended — write once, forever)
+
+     ${DIM}Replace <…> with the values from AWS Console → EC2 → Instances →${RESET}
+     ${DIM}<your time2leave instance>. "Public IPv4 DNS" is the HostName.${RESET}
+
+       cat >> ~/.ssh/config <<'SSH_CONFIG'
+
+       Host time2leave
+         HostName <your-ec2-public-ipv4-dns>
+         User ec2-user
+         IdentityFile ~/.ssh/<your-key>.pem
+       SSH_CONFIG
+
+       chmod 600 ~/.ssh/<your-key>.pem
+       ssh time2leave 'echo ok'        # smoke-test
+
+  ${BOLD}2) Override per-invocation${RESET}
+
+       t2l deploy be --host ec2-user@<your-ec2-public-ipv4-dns>
+
+  ${BOLD}3) Persist in your shell rc${RESET}
+
+       echo 'export T2L_EC2_HOST="ec2-user@<host>"' >> ~/.zshrc
+       source ~/.zshrc
+
+  ${DIM}The .pem file is whatever key you used when you first SSH'd into${RESET}
+  ${DIM}the box. If you've lost it, generate a new one and attach it via${RESET}
+  ${DIM}AWS Console → EC2 → Instance Connect.${RESET}
+
+HELP
+    exit 2
+}
+
+# ----------------------------------------------------------------------
 # Subcommand: deploy be — SSH to EC2 and redeploy.
 # ----------------------------------------------------------------------
 cmd_deploy_be() {
@@ -192,6 +247,26 @@ cmd_deploy_be() {
             *) die "deploy be: unknown flag '$1' (see ./t2l --help)";;
         esac
     done
+
+    # Pre-flight: detect the most common failure (host is a bare alias
+    # that's not in ~/.ssh/config) BEFORE shelling out, so we can show
+    # actionable instructions instead of ssh's cryptic error.
+    #
+    # `ssh -G $host` prints the post-config view (no network). If the
+    # resolved `hostname` field equals the input bare alias and looks
+    # like an alias (no dot, no leading digits), the alias is missing.
+    local resolved bare_host
+    bare_host="${host##*@}"
+    if ! ssh -G "$host" >/dev/null 2>&1; then
+        ssh_setup_help "$host"
+    fi
+    resolved="$(ssh -G "$host" 2>/dev/null | awk '$1=="hostname"{print $2; exit}')"
+    if [[ -z "$resolved" ]] \
+        || { [[ "$resolved" == "$bare_host" ]] \
+             && [[ "$resolved" != *.* ]] \
+             && [[ ! "$resolved" =~ ^[0-9]+\. ]]; }; then
+        ssh_setup_help "$host"
+    fi
 
     heading "Deploy backend → $host"
     info "ssh $host  →  git pull  →  docker build + compose up"
@@ -216,6 +291,127 @@ cmd_deploy_fe() {
     heading "Deploy web → S3 + CloudFront"
     info "build apps/web  →  aws s3 sync  →  cloudfront invalidation"
     make deploy-frontend
+}
+
+# ----------------------------------------------------------------------
+# Interactive mode picker for `deploy app`. Called when the user ran
+# `t2l deploy app` without --ota or --build and stdin is a TTY. Echoes
+# the chosen mode ("ota" or "build") on stdout; logs to stderr so the
+# caller can safely `mode="$(prompt_app_mode)"`.
+# ----------------------------------------------------------------------
+prompt_app_mode() {
+    {
+        echo ""
+        echo "${BOLD}deploy app — pick a mode${RESET}"
+        echo ""
+        echo "  ${BOLD}1) --ota${RESET}      JS-only OTA via EAS Update. Pushes to every existing"
+        echo "                install on next cold start. Fast (~30s). Use for"
+        echo "                fixes that don't touch native code."
+        echo ""
+        echo "  ${BOLD}2) --build${RESET}    Full native EAS build (cloud, ~15-25 min). Required"
+        echo "                for native code, plugin, entitlement, or"
+        echo "                app.config.ts changes. Combine with --submit to"
+        echo "                also push to TestFlight / Play Internal."
+        echo ""
+    } >&2
+    # Caller has already checked that stdin is a tty (`-t 0`), so a
+    # plain `read` reaches the user's keyboard. No need for /dev/tty.
+    local reply
+    while true; do
+        read -r -p "  ${BOLD}?${RESET} Which mode? [1/2] (Ctrl-C to cancel): " reply || die "deploy app: aborted"
+        case "$reply" in
+            1|ota|--ota)      echo "ota";   return ;;
+            2|build|--build)  echo "build"; return ;;
+            *) echo "    Please answer 1 or 2." >&2 ;;
+        esac
+    done
+}
+
+# ----------------------------------------------------------------------
+# Interactive platform picker for `deploy app`. Called when --platform
+# wasn't explicitly passed and stdin is a TTY. Default depends on mode:
+#   - ota   → ios (Android isn't on the Play Store yet)
+#   - build → both (cheap to build both in the cloud at the same time)
+# An empty reply accepts the default. Output is the canonical t2l value
+# ("ios" / "android" / "both"); the eas-call sites translate "both" to
+# eas's expected "all" keyword.
+# ----------------------------------------------------------------------
+prompt_app_platform() {
+    local mode="$1"
+    local default_num default_label
+    case "$mode" in
+        ota)   default_num=1; default_label="ios" ;;
+        build) default_num=3; default_label="both" ;;
+        *)     default_num=3; default_label="both" ;;
+    esac
+    {
+        echo ""
+        echo "${BOLD}deploy app ($mode) — pick a platform${RESET}"
+        echo ""
+        echo "  ${BOLD}1) ios${RESET}        iOS only"
+        echo "  ${BOLD}2) android${RESET}    Android only"
+        echo "  ${BOLD}3) both${RESET}       iOS + Android"
+        echo ""
+    } >&2
+    local reply
+    while true; do
+        read -r -p "  ${BOLD}?${RESET} Which platform? [1/2/3, default $default_num=$default_label]: " reply \
+            || die "deploy app: aborted"
+        reply="${reply:-$default_num}"
+        case "$reply" in
+            1|ios)              echo "ios";     return ;;
+            2|android)          echo "android"; return ;;
+            3|both|all)         echo "both";    return ;;
+            *) echo "    Please answer 1, 2, or 3." >&2 ;;
+        esac
+    done
+}
+
+# ----------------------------------------------------------------------
+# Interactive "build only" vs "build + submit" picker for the build
+# mode of `deploy app`. Only called when --submit wasn't passed and
+# stdin is a TTY. Echoes "0" (build only) or "1" (build + submit) so
+# the caller can `do_submit="$(prompt_app_submit "$platform")"`.
+#
+# Important UX note baked into the menu: neither option releases to
+# the public App Store / Play production track. --submit drops the
+# build into TestFlight / Play Internal — promotion to production is
+# still a manual ASC / Play Console step. Without saying so here,
+# users assume --submit means "ship to the world".
+# ----------------------------------------------------------------------
+prompt_app_submit() {
+    local platform="$1"
+    local destination
+    case "$platform" in
+        ios)     destination="iOS → App Store Connect → TestFlight (~30 min Apple processing)" ;;
+        android) destination="Android → Play Console Internal Testing track" ;;
+        both)    destination="iOS → TestFlight  +  Android → Play Internal Testing" ;;
+    esac
+    {
+        echo ""
+        echo "${BOLD}deploy app (build, $platform) — submit after the build?${RESET}"
+        echo ""
+        echo "  ${BOLD}1) just build${RESET}        Artifact stays on expo.dev. Download or"
+        echo "                       submit it later via 'eas submit'."
+        echo ""
+        echo "  ${BOLD}2) build + submit${RESET}    Upload to $destination."
+        echo ""
+        echo "  ${DIM}Neither option releases to the public App Store / Play production track —${RESET}"
+        echo "  ${DIM}those still require manual submission for App Review in App Store Connect /${RESET}"
+        echo "  ${DIM}promotion to the production track in Play Console.${RESET}"
+        echo ""
+    } >&2
+    local reply
+    while true; do
+        read -r -p "  ${BOLD}?${RESET} Submit too? [1/2, default 1=just build]: " reply \
+            || die "deploy app: aborted"
+        reply="${reply:-1}"
+        case "$reply" in
+            1|build|n|no)       echo "0"; return ;;
+            2|submit|y|yes)     echo "1"; return ;;
+            *) echo "    Please answer 1 or 2." >&2 ;;
+        esac
+    done
 }
 
 # ----------------------------------------------------------------------
@@ -256,10 +452,41 @@ cmd_deploy_app() {
         esac
     done
 
-    [[ -n "$mode" ]] || die "deploy app: must pass exactly one of --ota / --build"
+    # No mode? If we're attached to a terminal, ask. If we're being
+    # driven from CI or a pipe, fail with the canonical strict-mode
+    # error so automated runs don't hang waiting for stdin.
+    if [[ -z "$mode" ]]; then
+        if [[ -t 0 && -t 1 ]]; then
+            mode="$(prompt_app_mode)"
+        else
+            die "deploy app: must pass exactly one of --ota / --build (non-interactive shell, no prompt)"
+        fi
+    fi
+
+    # No --platform? If we're on a TTY, prompt; otherwise fall through
+    # to the per-mode default (ios for ota, both for build) so scripts
+    # keep working without surprise.
+    if [[ -z "$platform" && -t 0 && -t 1 ]]; then
+        platform="$(prompt_app_platform "$mode")"
+    fi
+
+    # Build-only: if --submit wasn't passed and we're on a TTY, ask
+    # whether to also submit. We have to ask AFTER platform is known so
+    # the menu can accurately describe which store gets the upload.
+    if [[ "$mode" == "build" && $do_submit -eq 0 && -t 0 && -t 1 ]]; then
+        do_submit="$(prompt_app_submit "${platform:-both}")"
+    fi
+
+    # Translate t2l's canonical "both" to whatever the eas subcommand
+    # actually expects: `eas build` wants "all", `eas update` also wants
+    # "all". Keeping the t2l surface in t2l vocabulary ("both") makes
+    # the prompts and help text read naturally.
+    local eas_platform="$platform"
+    [[ "$eas_platform" == "both" ]] && eas_platform="all"
 
     if [[ "$mode" == "ota" ]]; then
         platform="${platform:-ios}"
+        eas_platform="${eas_platform:-ios}"
         message="${message:-OTA update from t2l CLI on $(date +%Y-%m-%d)}"
         heading "Deploy app → EAS Update (OTA, channel=production, platform=$platform)"
         info "message: $message"
@@ -269,7 +496,7 @@ cmd_deploy_app() {
         npm run eas -- update \
             --channel production \
             --environment production \
-            --platform "$platform" \
+            --platform "$eas_platform" \
             --message "$message"
         cd - >/dev/null
         ok "OTA published. Existing installs pick it up on next cold start."
@@ -278,27 +505,36 @@ cmd_deploy_app() {
 
     # mode == build
     platform="${platform:-both}"
+    eas_platform="${eas_platform:-all}"
     heading "Deploy app → EAS Build (profile=production, platform=$platform)"
     info "Cloud build via EAS — ~15-25 min. Watch progress at expo.dev."
 
     cd apps/mobile
-    if [[ "$platform" == "both" ]]; then
-        npm run eas -- build --platform all --profile production
-    else
-        npm run eas -- build --platform "$platform" --profile production
-    fi
+    npm run eas -- build --platform "$eas_platform" --profile production
 
     if (( do_submit )); then
-        heading "Submit → store"
-        if [[ "$platform" == "both" ]]; then
-            npm run eas -- submit --platform all --latest
-        else
-            npm run eas -- submit --platform "$platform" --latest
-        fi
-        ok "Submitted. App Store Connect processing typically takes ~30 min."
+        heading "Submit → TestFlight / Play Internal"
+        npm run eas -- submit --platform "$eas_platform" --latest
+        case "$platform" in
+            ios)
+                ok "Submitted. iOS build lands in TestFlight after Apple processing (~30 min)."
+                info "Public App Store release is still a manual step: ASC → Apps → time2leave →"
+                info "+ Version → attach build → Submit for Review (Apple review: 1-7 days)."
+                ;;
+            android)
+                ok "Submitted to Play Console Internal Testing track."
+                info "Public Play Store release is still a manual step: Play Console → Production →"
+                info "Create new release → promote the Internal track build."
+                ;;
+            both)
+                ok "Submitted: iOS → TestFlight (~30 min Apple processing) + Android → Play Internal."
+                info "Public release on each store is still a manual step (ASC App Review / Play"
+                info "Console promotion to Production)."
+                ;;
+        esac
     else
-        info "Skipping submit. Run with --submit to push the latest build to"
-        info "TestFlight / Play Internal."
+        info "Skipping submit. Re-run with --submit (or pick 'build + submit' on the prompt) to"
+        info "upload the latest build to TestFlight / Play Internal."
     fi
     cd - >/dev/null
 }

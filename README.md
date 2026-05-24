@@ -276,13 +276,40 @@ fails fast with a clear message if `npm` or `aws` is missing.
 
 ### Backend — Docker on EC2
 
+One-line: `t2l deploy be` — SSHes into the EC2 box, `git pull`s, and
+runs `./scripts/build-and-deploy.sh` for you. The longhand still works
+if you want to drive each step manually:
+
 ```bash
-# On the EC2 host:
+# Equivalent of `t2l deploy be`, run by hand on the EC2 host:
 cd /home/ec2-user/time2leave
 git pull
 cd backend
 ./scripts/build-and-deploy.sh
 ```
+
+#### One-time SSH setup for `t2l deploy be`
+
+`t2l deploy be` defaults to the `~/.ssh/config` alias **`time2leave`**.
+On a fresh laptop, run it once — it prints the exact 5-line setup if
+the alias isn't configured. The canonical setup:
+
+```bash
+cat >> ~/.ssh/config <<'EOF'
+
+Host time2leave
+  HostName <your-ec2-public-ipv4-dns>   # AWS Console → EC2 → Instances → Public IPv4 DNS
+  User ec2-user
+  IdentityFile ~/.ssh/<your-key>.pem
+EOF
+
+chmod 600 ~/.ssh/<your-key>.pem
+ssh time2leave 'echo ok'                 # smoke-test
+```
+
+Alternatives: `t2l deploy be --host ec2-user@<host>` (per invocation)
+or `export T2L_EC2_HOST="ec2-user@<host>"` in `~/.zshrc` (persistent,
+no `~/.ssh/config` edit).
 
 Uses [`backend/docker-compose.yml`](backend/docker-compose.yml) to run the
 `time2leave-api` container on port 8485, joined to the external `shared_network`
