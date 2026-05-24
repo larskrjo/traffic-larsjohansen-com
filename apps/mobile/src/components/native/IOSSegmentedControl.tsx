@@ -1,51 +1,36 @@
 /**
- * Segmented control with iOS 26 native Liquid Glass styling.
+ * Segmented control — iOS path uses the real native `UISegmentedControl`
+ * surfaced by `@expo/ui`'s `Picker` with `pickerStyle('segmented')`.
  *
- * What this renders on iOS:
- *   A Phone-app-style unified Liquid Glass *track* with a sliding
- *   *thumb* that spring-animates between segments — built from real
- *   SwiftUI primitives via `@expo/ui`, embedded in a
- *   `UIHostingController`. The shape of the rendered tree on the
- *   device is:
+ * Rationale:
+ *   Per Apple's WWDC25 UIKit session ("Build a UIKit app with the new
+ *   design"), the *only* official iOS 26 native primitive for in-content
+ *   segmented selection is `UISegmentedControl` — its thumb automatically
+ *   adopts the Liquid Glass appearance during interaction once the binary
+ *   is compiled against the iOS 26 SDK (Xcode 26+). Apps recompile and
+ *   get the new look for free; there is no "Liquid Glass segmented pill"
+ *   API to opt into.
  *
- *     ZStack(.leading) {
- *       Capsule().glassEffect(.regular)              // track
- *       Capsule().glassEffect(.regular.tint(brand))  // sliding thumb
- *         .frame(width: segmentWidth)
- *         .offset(x: selectedIndex * segmentWidth)
- *         .animation(.spring, value: selectedIndex)
- *       HStack { Button(label){ … }.buttonStyle(.plain) … } // hit targets
- *     }
- *
- *   Apple's framework handles the Liquid Glass material, the
- *   refraction, the dark/light adaptation, and — importantly — the
- *   spring animation on the thumb's `offset` whenever
- *   `selectedIndex` changes. Tap a segment, the thumb slides; same
- *   visual language as iOS 26's Phone, Mail and Notes apps.
- *
- * Why not just `UISegmentedControl`?
- *   iOS 26's automatic Liquid Glass adoption hasn't reached
- *   `UISegmentedControl` outside nav bars / toolbars — see
- *   `expo/expo#44739`. Both `@expo/ui`'s `Picker(.segmented)` and
- *   the community segmented-control package still render the *old*
- *   bordered style on iOS 26. So we compose the same visual from
- *   first principles using Apple's `glassEffect` modifier on
- *   `Capsule` shapes (the iOS 26 documented pattern).
- *
- * Why we measure width in JS:
- *   SwiftUI normally uses `GeometryReader` for "this view's
- *   percentage of available space" math, but `@expo/ui` doesn't
- *   expose `GeometryReader`. We measure the wrapping React Native
- *   `View`'s width via `onLayout` and pass concrete pixel widths to
- *   the SwiftUI `frame(width:)` and `offset(x:)` modifiers. Cheap
- *   and reliable; the host view rarely resizes.
+ *   The SwiftUI counterpart `Picker(.segmented)` lowers to
+ *   `UISegmentedControl` on iOS, so going through `@expo/ui`'s `Picker`
+ *   gives us the same real UIKit control — embedded in a
+ *   `UIHostingController` by `@expo/ui` `Host`. There is a known issue
+ *   (`expo/expo#44739`) that this hosting layer can break the Liquid
+ *   Glass adoption in some configurations; we prefer this path anyway
+ *   because:
+ *     1. It is the actual platform primitive, not a JS-composed
+ *        approximation made of `Capsule + glassEffect`.
+ *     2. Future SDK fixes to either iOS or `@expo/ui` will land for free.
+ *     3. If the bug bites, we fall back to a vendored UIKit bridge in a
+ *        separate step (see `react-native-platform-components`), keeping
+ *        the public API of this component unchanged.
  *
  * Fallbacks:
- *   - Android: the JS-built control below (track + sliding thumb
- *     using `LayoutAnimation`). SwiftUI obviously isn't available.
- *   - iOS < 26: `glassEffect` is a no-op on older OSs, falling back
- *     to plain capsules. Acceptable for the small slice of users
- *     we expect on iOS 25 or below.
+ *   - Android: a JS-built track + sliding thumb (`LayoutAnimation`).
+ *     SwiftUI / UIKit obviously aren't available.
+ *   - iOS < 26: `UISegmentedControl` falls back to its iOS 18 bordered
+ *     appearance automatically. Acceptable for the small slice of users
+ *     we expect on older iOS.
  */
 import { useEffect, useRef, useState } from "react";
 import {
@@ -55,29 +40,16 @@ import {
     StyleSheet,
     UIManager,
     View,
-    type LayoutChangeEvent,
     type StyleProp,
     type ViewStyle,
 } from "react-native";
 import { Text, useTheme } from "react-native-paper";
 import {
-    Button,
-    Capsule,
     Host,
-    HStack,
+    Picker,
     Text as SwiftUIText,
-    ZStack,
 } from "@expo/ui/swift-ui";
-import {
-    Animation,
-    animation,
-    buttonStyle,
-    font,
-    foregroundStyle,
-    frame,
-    glassEffect,
-    offset,
-} from "@expo/ui/swift-ui/modifiers";
+import { pickerStyle, tag } from "@expo/ui/swift-ui/modifiers";
 
 if (
     Platform.OS === "android" &&
@@ -106,27 +78,12 @@ export function IOSSegmentedControl<V extends string>(props: Props<V>) {
 }
 
 /**
- * iOS 26 path — Phone-app-style sliding Liquid Glass segmented control.
- *
- * Composition (top-down inside the ZStack):
- *   1. Track:   full-width `Capsule` with `glassEffect(.regular)`.
- *   2. Thumb:   1/N-width `Capsule` with `glassEffect(.regular,
- *               tint: brand)`, positioned via `offset(x:)` and
- *               spring-animated against `selectedIndex`.
- *   3. Targets: an `HStack` of `Button(.plain)` hit-targets that
- *               just call `onChange`. They live above the thumb so
- *               taps register, and they each carry a `Text` label
- *               whose colour we flip when selected.
- *
- * The trick that makes the slide work without `GeometryReader`:
- *   We measure the React Native wrapper `View`'s width via
- *   `onLayout`, divide by `options.length`, and feed concrete
- *   pixel widths to SwiftUI's `frame(width:)` + `offset(x:)`. The
- *   `animation()` modifier ties the offset change to a spring
- *   keyed on `selectedIndex`, so SwiftUI does the easing.
+ * iOS path — `@expo/ui` `Picker` styled with `pickerStyle('segmented')`.
+ * SwiftUI's `Picker(.segmented)` lowers to `UISegmentedControl` on iOS,
+ * so this renders the real native control. On iOS 26 with Xcode 26 the
+ * binary picks up the new Liquid Glass thumb appearance automatically.
  */
 const TRACK_HEIGHT = 36;
-const THUMB_INSET = 3;
 
 function NativeGlassSegmentedControl<V extends string>({
     value,
@@ -134,128 +91,27 @@ function NativeGlassSegmentedControl<V extends string>({
     onChange,
     style,
 }: Props<V>) {
-    const theme = useTheme();
-    const [width, setWidth] = useState(0);
-
-    const selectedIdx = Math.max(
-        0,
-        options.findIndex((o) => o.value === value),
-    );
-
-    const onLayout = (e: LayoutChangeEvent) => {
-        const w = e.nativeEvent.layout.width;
-        if (w !== width) setWidth(w);
-    };
-
-    const segmentWidth = width > 0 ? width / options.length : 0;
-    const thumbWidth = Math.max(0, segmentWidth - THUMB_INSET * 2);
-    const thumbOffsetX = THUMB_INSET + segmentWidth * selectedIdx;
-    const thumbHeight = TRACK_HEIGHT - THUMB_INSET * 2;
-
     return (
-        <View
-            onLayout={onLayout}
-            style={[{ height: TRACK_HEIGHT }, style]}
-        >
-            {width > 0 ? (
-                <Host style={{ flex: 1 }}>
-                    <ZStack alignment="leading">
-                        {/* Track — soft Liquid Glass capsule. */}
-                        <Capsule
-                            modifiers={[
-                                frame({
-                                    width,
-                                    height: TRACK_HEIGHT,
-                                }),
-                                glassEffect({
-                                    glass: { variant: "regular" },
-                                    shape: "capsule",
-                                }),
-                            ]}
-                        />
-
-                        {/* Sliding thumb — prominent tinted glass
-                            capsule. The `animation()` modifier turns
-                            any change in `selectedIdx` into a spring
-                            slide of the offset. */}
-                        <Capsule
-                            modifiers={[
-                                frame({
-                                    width: thumbWidth,
-                                    height: thumbHeight,
-                                }),
-                                offset({ x: thumbOffsetX, y: THUMB_INSET }),
-                                glassEffect({
-                                    glass: {
-                                        variant: "regular",
-                                        tint: theme.colors.primary,
-                                    },
-                                    shape: "capsule",
-                                }),
-                                animation(
-                                    Animation.spring({
-                                        response: 0.35,
-                                        dampingFraction: 0.85,
-                                    }),
-                                    selectedIdx,
-                                ),
-                            ]}
-                        />
-
-                        {/* Hit targets — plain (chromeless) buttons
-                            laid out edge-to-edge. The label colour
-                            flips to `onPrimary` when its segment is
-                            the active one so the text reads against
-                            the tinted thumb. */}
-                        <HStack spacing={0}>
-                            {options.map((opt) => {
-                                const selected = opt.value === value;
-                                return (
-                                    <Button
-                                        key={opt.value}
-                                        onPress={() => {
-                                            if (opt.value !== value)
-                                                onChange(opt.value);
-                                        }}
-                                        modifiers={[
-                                            buttonStyle("plain"),
-                                            frame({
-                                                width: segmentWidth,
-                                                height: TRACK_HEIGHT,
-                                            }),
-                                            foregroundStyle(
-                                                selected
-                                                    ? theme.colors.onPrimary
-                                                    : theme.colors
-                                                          .onBackground,
-                                            ),
-                                        ]}
-                                    >
-                                        <SegmentLabel label={opt.label} />
-                                    </Button>
-                                );
-                            })}
-                        </HStack>
-                    </ZStack>
-                </Host>
-            ) : null}
+        <View style={[{ minHeight: TRACK_HEIGHT }, style]}>
+            <Host matchContents>
+                <Picker
+                    selection={value}
+                    onSelectionChange={(next) => {
+                        if (next !== value) onChange(next as V);
+                    }}
+                    modifiers={[pickerStyle("segmented")]}
+                >
+                    {options.map((opt) => (
+                        <SwiftUIText
+                            key={opt.value}
+                            modifiers={[tag(opt.value)]}
+                        >
+                            {opt.label}
+                        </SwiftUIText>
+                    ))}
+                </Picker>
+            </Host>
         </View>
-    );
-}
-
-/**
- * Tiny SwiftUI `Text` wrapped to centre inside the parent `Button`
- * frame. We use `@expo/ui`'s Text rather than React Native's so it
- * stays inside the SwiftUI render tree (no UIKit↔SwiftUI bridging
- * for every label, which would defeat the point).
- */
-function SegmentLabel({ label }: { label: string }) {
-    return (
-        <SwiftUIText
-            modifiers={[font({ size: 13, weight: "semibold" })]}
-        >
-            {label}
-        </SwiftUIText>
     );
 }
 

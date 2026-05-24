@@ -5,6 +5,10 @@
     "apps/*",
     "packages/*"
   ],
+  "overrides": {
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
   "scripts": {
     "build:web": "npm run build --workspace=@time2leave/web",
     "dev:web": "npm run dev --workspace=@time2leave/web",

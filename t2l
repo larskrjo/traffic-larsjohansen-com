@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+#
+# t2l — Time2Leave dev + deploy CLI.
+#
+# A thin orchestrator over the project's existing Make targets, npm
+# scripts, EAS commands and AWS / SSH workflows. Each subcommand maps
+# to exactly one well-defined operation; this file deliberately does
+# not invent new build pipelines, it just dispatches to the canonical
+# ones already living in:
+#
+#   - Makefile                          (local dev stack, web build)
+#   - backend/scripts/build-and-deploy.sh   (runs ON EC2)
+#   - apps/web/scripts/deploy-to-s3.sh      (S3 + CloudFront)
+#   - apps/mobile/package.json `eas` script (sources .env then runs eas)
+#
+# Usage: ./t2l --help
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------
+# Resolve the repo root regardless of where the user invoked us from,
+# then cd into it. Every downstream tool (make, npm, eas) assumes
+# repo-root cwd. We deliberately follow symlinks so that `t2l`
+# invoked via ~/.local/bin/t2l → <repo>/t2l (the setup.sh install
+# path) still lands on the actual checkout. Portable across BSD bash
+# 3.2 (macOS default) and GNU bash.
+# ----------------------------------------------------------------------
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ----------------------------------------------------------------------
+# Pretty output (colors only when stdout is a TTY).
+# ----------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    BOLD="$(printf '\033[1m')"
+    DIM="$(printf '\033[2m')"
+    GREEN="$(printf '\033[32m')"
+    YELLOW="$(printf '\033[33m')"
+    RED="$(printf '\033[31m')"
+    BLUE="$(printf '\033[34m')"
+    RESET="$(printf '\033[0m')"
+else
+    BOLD=""; DIM=""; GREEN=""; YELLOW=""; RED=""; BLUE=""; RESET=""
+fi
+
+heading() {
+    echo ""
+    echo "${BOLD}${BLUE}══ $1 ══${RESET}"
+}
+ok()   { echo "  ${GREEN}✓${RESET} $1"; }
+warn() { echo "  ${YELLOW}⚠${RESET} $1"; }
+fail() { echo "  ${RED}✗${RESET} $1" >&2; }
+info() { echo "  ${DIM}$1${RESET}"; }
+
+die() { fail "$1"; exit "${2:-1}"; }
+
+# ----------------------------------------------------------------------
+# Help text.
+# ----------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${BOLD}t2l${RESET} — Time2Leave dev + deploy CLI
+
+${BOLD}Usage:${RESET}
+  ./t2l <command> [target] [flags]
+
+${BOLD}Local — start / restart with latest local code${RESET}
+  ${BOLD}up be${RESET}              MySQL + FastAPI in Docker (apps/web hits http://localhost:8000)
+                     ${DIM}--rebuild${RESET}   Force rebuild of the API image + recreate containers.
+  ${BOLD}up fe${RESET}              Vite dev server for apps/web at http://localhost:5173 (foreground).
+  ${BOLD}up ios${RESET}             Expo Metro for apps/mobile (foreground).
+                     ${DIM}--rebuild${RESET}   Full native build: expo prebuild + pod install + Xcode build.
+                                  Use after changing native plugins / app.config.ts / entitlements.
+                     ${DIM}--device <name>${RESET}   Override the iOS device for --rebuild
+                                  (default: "Lars Kristians iPhone").
+
+${BOLD}Remote — deploy to production${RESET}
+  ${BOLD}deploy be${RESET}          Build + push backend on the EC2 host (SSH in, git pull, docker
+                     build, docker compose up).
+                     ${DIM}--host <user@host>${RESET}   Override SSH target.
+                                       Default: \$T2L_EC2_HOST or "time2leave".
+  ${BOLD}deploy fe${RESET}          Build apps/web, sync to S3, invalidate CloudFront. Runs locally;
+                     needs Node 20+ and AWS creds for bucket time2leave-frontend.
+  ${BOLD}deploy app${RESET}         Mobile app distribution. Exactly one of:
+                     ${DIM}--ota${RESET}      EAS Update (OTA, JS-only). Existing installs pick this up on
+                                next cold start. Use for fixes that don't touch native code.
+                                  ${DIM}--message "<msg>"${RESET}   Required-ish release note.
+                                  ${DIM}--platform ios|android|both${RESET}   Default: ios.
+                     ${DIM}--build${RESET}    Full native EAS build (production profile, cloud, signs
+                                automatically).
+                                  ${DIM}--platform ios|android|both${RESET}   Default: both.
+                                  ${DIM}--submit${RESET}   After build, submit the latest build to
+                                              TestFlight / Play Internal.
+
+${BOLD}Misc${RESET}
+  ${BOLD}help${RESET}, --help, -h     Show this message.
+
+${BOLD}Examples:${RESET}
+  ./t2l up be                                 # bring up local backend
+  ./t2l up be --rebuild                       # nuke + rebuild API container
+  ./t2l up fe                                 # vite dev server
+  ./t2l up ios                                # Metro only (JS hot reload on existing dev build)
+  ./t2l up ios --rebuild                      # full native rebuild (new plugins / entitlements)
+
+  ./t2l deploy be                             # ssh + redeploy api.time2leave.com
+  ./t2l deploy fe                             # publish to time2leave.com (S3 + CloudFront)
+  ./t2l deploy app --ota --message "fix tab"  # OTA via EAS Update
+  ./t2l deploy app --build --platform ios --submit
+                                              # build + submit iOS to TestFlight
+
+${BOLD}Environment:${RESET}
+  T2L_EC2_HOST       SSH target for 'deploy be'. Either a ~/.ssh/config alias
+                     ('time2leave') or 'ec2-user@<ip>'. Default: 'time2leave'.
+EOF
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: up be — start / restart local backend (Docker).
+# ----------------------------------------------------------------------
+cmd_up_be() {
+    local rebuild=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rebuild) rebuild=1; shift ;;
+            *) die "up be: unknown flag '$1' (see ./t2l --help)";;
+        esac
+    done
+
+    heading "Local backend (mysql + api in Docker)"
+    if (( rebuild )); then
+        info "rebuild=on — tearing containers down before recreating"
+        docker compose -f backend/docker-compose.dev.yml down
+        docker compose -f backend/docker-compose.dev.yml up -d --build --force-recreate
+    else
+        # `make dev-be` is `docker compose up -d --build` — idempotent.
+        # It rebuilds the image only when the Dockerfile/source changes,
+        # which is what "restart with latest local code" should mean.
+        make dev-be
+    fi
+    ok "Backend up.  API → http://localhost:${API_HOST_PORT:-8000}"
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: up fe — Vite dev server (foreground).
+# ----------------------------------------------------------------------
+cmd_up_fe() {
+    [[ $# -eq 0 ]] || die "up fe: takes no flags (got '$*')"
+    heading "Local web (Vite dev server)"
+    info "starting in the foreground — Ctrl-C to stop, then re-run ./t2l up fe to restart"
+    exec make dev-fe
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: up ios — Metro (default) or full native rebuild.
+# ----------------------------------------------------------------------
+cmd_up_ios() {
+    local rebuild=0
+    local device="${IOS_DEVICE:-Lars Kristians iPhone}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rebuild) rebuild=1; shift ;;
+            --device) device="${2:?--device requires a value}"; shift 2 ;;
+            *) die "up ios: unknown flag '$1' (see ./t2l --help)";;
+        esac
+    done
+
+    heading "Local iOS (Expo)"
+    if (( rebuild )); then
+        info "rebuild=on — expo prebuild + pod install + native build on '$device'"
+        IOS_DEVICE="$device" exec make dev-ios
+    else
+        info "Metro only — assumes a dev build is already installed on the device."
+        info "If JS fails to load, re-run with --rebuild to refresh native code."
+        exec make dev-ios-start
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: deploy be — SSH to EC2 and redeploy.
+# ----------------------------------------------------------------------
+cmd_deploy_be() {
+    local host="${T2L_EC2_HOST:-time2leave}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host) host="${2:?--host requires a value}"; shift 2 ;;
+            *) die "deploy be: unknown flag '$1' (see ./t2l --help)";;
+        esac
+    done
+
+    heading "Deploy backend → $host"
+    info "ssh $host  →  git pull  →  docker build + compose up"
+    # Quote the inner command via single-quotes; the remote shell expands
+    # nothing locally. `set -euo pipefail` on the remote so a failing
+    # `git pull` (e.g. uncommitted changes) aborts before the rebuild.
+    ssh -t "$host" 'set -euo pipefail; \
+        cd /home/ec2-user/time2leave && \
+        git pull --ff-only && \
+        cd backend && \
+        ./scripts/build-and-deploy.sh'
+    ok "Backend deployed. Smoke test:"
+    info "  curl https://api.time2leave.com/healthcheck"
+    info "  curl https://api.time2leave.com/healthcheck/scheduler"
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: deploy fe — build + publish to S3 + invalidate CloudFront.
+# ----------------------------------------------------------------------
+cmd_deploy_fe() {
+    [[ $# -eq 0 ]] || die "deploy fe: takes no flags (got '$*')"
+    heading "Deploy web → S3 + CloudFront"
+    info "build apps/web  →  aws s3 sync  →  cloudfront invalidation"
+    make deploy-frontend
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: deploy app — mobile distribution (OTA or full build).
+# ----------------------------------------------------------------------
+cmd_deploy_app() {
+    local mode=""
+    local platform=""
+    local message=""
+    local do_submit=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ota)
+                [[ -z "$mode" ]] || die "deploy app: pick one of --ota / --build"
+                mode="ota"; shift
+                ;;
+            --build)
+                [[ -z "$mode" ]] || die "deploy app: pick one of --ota / --build"
+                mode="build"; shift
+                ;;
+            --platform)
+                platform="${2:?--platform requires a value}"
+                case "$platform" in
+                    ios|android|both) ;;
+                    *) die "deploy app: --platform must be ios|android|both";;
+                esac
+                shift 2
+                ;;
+            --message)
+                message="${2:?--message requires a value}"
+                shift 2
+                ;;
+            --submit)
+                do_submit=1; shift
+                ;;
+            *) die "deploy app: unknown flag '$1' (see ./t2l --help)";;
+        esac
+    done
+
+    [[ -n "$mode" ]] || die "deploy app: must pass exactly one of --ota / --build"
+
+    if [[ "$mode" == "ota" ]]; then
+        platform="${platform:-ios}"
+        message="${message:-OTA update from t2l CLI on $(date +%Y-%m-%d)}"
+        heading "Deploy app → EAS Update (OTA, channel=production, platform=$platform)"
+        info "message: $message"
+        # `npm run eas` is the wrapper that sources apps/mobile/.env first.
+        # `--environment production` mirrors what the cloud build sees.
+        cd apps/mobile
+        npm run eas -- update \
+            --channel production \
+            --environment production \
+            --platform "$platform" \
+            --message "$message"
+        cd - >/dev/null
+        ok "OTA published. Existing installs pick it up on next cold start."
+        return
+    fi
+
+    # mode == build
+    platform="${platform:-both}"
+    heading "Deploy app → EAS Build (profile=production, platform=$platform)"
+    info "Cloud build via EAS — ~15-25 min. Watch progress at expo.dev."
+
+    cd apps/mobile
+    if [[ "$platform" == "both" ]]; then
+        npm run eas -- build --platform all --profile production
+    else
+        npm run eas -- build --platform "$platform" --profile production
+    fi
+
+    if (( do_submit )); then
+        heading "Submit → store"
+        if [[ "$platform" == "both" ]]; then
+            npm run eas -- submit --platform all --latest
+        else
+            npm run eas -- submit --platform "$platform" --latest
+        fi
+        ok "Submitted. App Store Connect processing typically takes ~30 min."
+    else
+        info "Skipping submit. Run with --submit to push the latest build to"
+        info "TestFlight / Play Internal."
+    fi
+    cd - >/dev/null
+}
+
+# ----------------------------------------------------------------------
+# Top-level dispatcher.
+# ----------------------------------------------------------------------
+verb="${1:-help}"
+shift || true
+
+case "$verb" in
+    up)
+        target="${1:-}"; shift || true
+        case "$target" in
+            be)  cmd_up_be  "$@" ;;
+            fe)  cmd_up_fe  "$@" ;;
+            ios) cmd_up_ios "$@" ;;
+            "")  die "up: missing target. Use 'be', 'fe' or 'ios' (see ./t2l --help)";;
+            *)   die "up: unknown target '$target' — expected be|fe|ios";;
+        esac
+        ;;
+    deploy)
+        target="${1:-}"; shift || true
+        case "$target" in
+            be)  cmd_deploy_be  "$@" ;;
+            fe)  cmd_deploy_fe  "$@" ;;
+            app) cmd_deploy_app "$@" ;;
+            "")  die "deploy: missing target. Use 'be', 'fe' or 'app' (see ./t2l --help)";;
+            *)   die "deploy: unknown target '$target' — expected be|fe|app";;
+        esac
+        ;;
+    help|--help|-h) usage ;;
+    *) fail "unknown command '$verb'"; echo ""; usage; exit 1 ;;
+esac

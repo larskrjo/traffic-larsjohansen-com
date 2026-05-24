@@ -40,21 +40,48 @@ types, the API client, time/slot helpers, and heatmap math.
 ## Quickstart
 
 The fastest path on a fresh checkout is the interactive bootstrap
-script — it walks you through prereq checks, installing deps,
-creating `backend/.env`, configuring the mobile app's env via GCP
-Secret Manager, and bringing up the dev stack. Every step prompts
-before touching anything and is safe to re-run any time:
+script — it walks you through prereq checks, **installs the `t2l`
+CLI to `~/.local/bin` with tab-completion**, installs deps, creates
+`backend/.env`, configures the mobile app's env via GCP Secret
+Manager, and brings up the dev stack. Every step prompts before
+touching anything and is safe to re-run any time:
 
 ```bash
 ./setup.sh
 ```
 
-If you'd rather drive Make targets directly:
+The `t2l` install is a **symlink** into this checkout, so `git pull`
+is enough to pick up new CLI commands — you only need to re-run
+`./setup.sh` if you started from a fresh clone or if the repo moved
+on disk.
+
+After the first run, open a new terminal (or `source ~/.zshrc`) and
+drive everything through `t2l` — one verb per component, one flag for
+whether you mean local or remote. **Tab-complete every subcommand
+and flag.**
+
+```bash
+t2l up be                 # mysql + api in docker (local)
+t2l up fe                 # web on http://localhost:5173 (local)
+t2l up ios                # Metro for the mobile app (local)
+
+t2l deploy be             # ssh + redeploy api.time2leave.com
+t2l deploy fe             # build + push web to time2leave.com (S3 + CloudFront)
+t2l deploy app --ota --message "<msg>"            # OTA via EAS Update
+t2l deploy app --build --platform ios --submit    # full build + TestFlight
+```
+
+Run `t2l --help` for the full reference including `--rebuild` for
+backend (force recreate containers) and iOS (full native rebuild).
+The CLI is a thin wrapper over the existing Make targets and EAS /
+S3 / SSH workflows — anything `t2l` does can also be done via
+`make <target>` or `npm run eas -- …` directly:
 
 ```bash
 make install      # set up backend venv + JS workspace node_modules
-make dev-be       # mysql + api in docker (schema + dev user seeded automatically)
-make dev-fe       # web app on http://localhost:5173 (apps/web)
+make dev-be       # equivalent of 't2l up be'
+make dev-fe       # equivalent of 't2l up fe'
+make deploy-frontend   # equivalent of 't2l deploy fe'
 ```
 
 For the mobile app, the canonical runtime is a **development build**
@@ -64,7 +91,7 @@ takes ~5–10 minutes; afterwards Metro hot-reloads JS instantly:
 ```bash
 npm run env:pull:mobile -- local       # hydrate apps/mobile/.env from GCP
 npm run build:ios:mobile               # one-time: build + install on iPhone simulator
-npm run dev:mobile                     # day-to-day: Metro only
+t2l up ios                             # day-to-day: Metro only
 ```
 
 Open http://localhost:5173, click **"Continue as dev user"** (the
@@ -73,12 +100,13 @@ with one trip already populated. No Google Maps API key, OAuth client,
 or AWS credentials required.
 
 > **Upgrading from the single-user schema?** The `docker-entrypoint-initdb.d`
-> scripts only run on a fresh MySQL volume. Run `make clean && make dev-be`
+> scripts only run on a fresh MySQL volume. Run `make clean && t2l up be`
 > once to wipe the old `commute_slots`-era volume and let the new
 > multi-user schema + dev-user seed apply.
 
-Run `make help` for the full target list (`test`, `typecheck`, `logs`,
-`seed`, `clean`, `deploy-frontend`, …).
+Run `make help` for the full Make target list (`test`, `typecheck`,
+`logs`, `seed`, `clean`, …) — these stay around for granular tasks
+that aren't part of the `t2l` surface.
 
 ## Architecture
 

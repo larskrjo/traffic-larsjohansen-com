@@ -12,11 +12,14 @@ fake it in JS.
 
 ## ✅ Approved primitives (already installed in this repo)
 
-- `@expo/ui/swift-ui` — `Host`, `ZStack`, `HStack`, `Capsule`,
-  `RoundedRectangle`, `Button`, `Text`.
-- `@expo/ui/swift-ui/modifiers` — `glassEffect({ glass: { variant,
-  tint }, shape })`, `buttonStyle('glass' | 'glassProminent')`,
-  `animation(Animation.spring(...), value)` for sliding/morphing.
+- `@expo/ui/swift-ui` — `Host`, `Picker`, `ZStack`, `HStack`,
+  `Capsule`, `RoundedRectangle`, `Button`, `Text`, `Namespace`,
+  `GlassEffectContainer`.
+- `@expo/ui/swift-ui/modifiers` — `pickerStyle('segmented')`,
+  `tag(value)`, `glassEffect({ glass: { variant, tint, interactive },
+  shape })`, `glassEffectId(id, namespace)`, `buttonStyle('glass' |
+  'glassProminent')`, `animation(Animation.spring(...), value)` for
+  sliding/morphing.
 - `expo-glass-effect` — `GlassView` + `isGlassEffectAPIAvailable()`
   for nav-bar / overlay backgrounds.
 - See `apps/mobile/src/components/native/IOSSegmentedControl.tsx`
@@ -32,10 +35,43 @@ fake it in JS.
   Liquid Glass).
 - Any custom JS-drawn pill / track / thumb that *imitates* the
   glass material with shadows + translucent tints.
-- `UISegmentedControl` / `@expo/ui` `Picker('segmented')` for
-  Liquid Glass — known broken on iOS 26 (`expo/expo#44739`,
-  renders the legacy bordered style). Compose from `Capsule` +
-  `glassEffect` instead.
+- Hand-composing a segmented control out of `Capsule` +
+  `glassEffect` when the user wants the native iOS 26 look. On
+  flat backgrounds the composition reads as a heavy gray track
+  with an inset blob — visually nothing like Apple's Phone / Mail
+  controls. Use `@expo/ui` `Picker` with
+  `pickerStyle('segmented')` instead (see "Segmented controls"
+  below). Historical note: `expo/expo#44739` claimed the SwiftUI
+  Picker rendered the legacy bordered style on iOS 26 via
+  `UIHostingController`; that turned out to be stale by 20 May
+  2026 with `@expo/ui` 55.0.13 + iOS 26.4 — the real
+  `UISegmentedControl` shows up with the correct Liquid Glass
+  appearance on both simulator and device.
+
+## Segmented controls — use the real `UISegmentedControl`
+
+```tsx
+import { Host, Picker, Text } from "@expo/ui/swift-ui";
+import { pickerStyle, tag } from "@expo/ui/swift-ui/modifiers";
+
+<Host matchContents>
+  <Picker
+    selection={value}
+    onSelectionChange={(next) => onChange(next as V)}
+    modifiers={[pickerStyle("segmented")]}
+  >
+    {options.map((opt) => (
+      <Text key={opt.value} modifiers={[tag(opt.value)]}>
+        {opt.label}
+      </Text>
+    ))}
+  </Picker>
+</Host>
+```
+
+SwiftUI's `Picker(.segmented)` lowers to a real `UISegmentedControl`
+on iOS. Apple's iOS 26 SDK gives that control the Liquid Glass thumb
+appearance automatically — no composition required.
 
 ## Required workflow when adding glass
 

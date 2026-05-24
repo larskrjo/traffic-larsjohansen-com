@@ -5,11 +5,13 @@
 # Walks a fresh checkout through everything required to develop locally:
 #
 #   1. Verify required CLI tools (node, npm, python3, docker, gcloud).
-#   2. Install JS workspace + backend Python dependencies.
-#   3. Create / inspect backend/.env.
-#   4. (Optional) Configure mobile env via GCP Secret Manager
+#   2. Install the `t2l` CLI to ~/.local/bin + shell tab-completion.
+#   3. Install JS workspace + backend Python dependencies.
+#   4. Create / inspect backend/.env.
+#   5. (Optional) Configure mobile env via GCP Secret Manager
 #      (set + pull the per-mode required secrets).
-#   5. Bring up the dev stack (mysql + backend in docker).
+#   6. Bring up the dev stack (mysql + backend in docker).
+#   7. (Optional) First-time iOS dev build for the mobile app.
 #
 # Every step is **skippable** (y/n prompt with a sensible default) and
 # **idempotent** — re-running this script never overwrites existing
@@ -43,7 +45,7 @@ else
 fi
 
 step_num=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 step() {
     step_num=$((step_num + 1))
     echo ""
@@ -122,14 +124,18 @@ ${DIM}repo: ${SCRIPT_DIR}${RESET}
 This script walks you through everything needed to develop locally:
 
   1. Verify required CLI tools
-  2. Install JS workspace + backend Python deps
-  3. Create / inspect backend/.env
-  4. (Optional) Configure mobile env via GCP Secret Manager
-  5. Start the dev stack (mysql + backend in docker)
-  6. (Optional) First-time iOS dev build for the mobile app
+  2. Install the t2l CLI globally + tab-completion (so you can run
+     't2l up be', 't2l deploy app --ota', etc. from anywhere)
+  3. Install JS workspace + backend Python deps
+  4. Create / inspect backend/.env
+  5. (Optional) Configure mobile env via GCP Secret Manager
+  6. Start the dev stack (mysql + backend in docker)
+  7. (Optional) First-time iOS dev build for the mobile app
 
 You can stop and re-run any time — every step prompts before touching
-anything and detects work that's already been done.
+anything and detects work that's already been done. Re-running this
+script after a 'git pull' also refreshes the t2l install if any CLI
+files moved.
 
 EOF
 
@@ -181,11 +187,153 @@ if [[ "${HAS_PYTHON3:-0}" -ne 1 ]]; then
     exit 1
 fi
 if [[ "${HAS_DOCKER:-0}" -ne 1 ]]; then
-    warn "docker is required for 'make dev-be' — install it before running step 5."
+    warn "docker is required for 'make dev-be' — install it before running step 6."
 fi
 
 # ============================================================================
-# Step 2 — Install dependencies
+# Step 2 — Install the t2l CLI globally + shell tab-completion
+# ============================================================================
+step "Install t2l CLI + tab-completion"
+
+# Strategy:
+#   - Symlink ~/.local/bin/t2l → $SCRIPT_DIR/t2l so the CLI auto-updates
+#     whenever you `git pull` (no copy step).
+#   - Append an idempotent marker-delimited block to the user's shell rc
+#     that puts ~/.local/bin on PATH and sources the completion file from
+#     the repo. Same auto-update story — pulling new completions in this
+#     repo updates completion behaviour on the next new shell.
+#   - Re-running setup.sh rewrites the block in place, so moving the
+#     repo elsewhere on disk is fixed by one re-run.
+
+BIN_DIR="$HOME/.local/bin"
+T2L_SRC="$SCRIPT_DIR/t2l"
+T2L_LINK="$BIN_DIR/t2l"
+MARKER="time2leave CLI"
+BEGIN_LINE="# >>> ${MARKER} >>>"
+END_LINE="# <<< ${MARKER} <<<"
+
+if [[ ! -x "$T2L_SRC" ]]; then
+    fail "Can't find an executable t2l at $T2L_SRC — repo is in a weird state."
+    info "Did the file lose its +x bit? Run: chmod +x t2l   (then re-run ./setup.sh)"
+    exit 1
+fi
+
+# Strip any prior block from the rc file. Uses /BEGIN/,/END/d which is
+# portable across BSD sed (macOS) and GNU sed (Linux).
+strip_block() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    grep -qF "$BEGIN_LINE" "$file" || return 0
+    local tmp
+    tmp="$(mktemp)"
+    sed "/^${BEGIN_LINE}\$/,/^${END_LINE}\$/d" "$file" > "$tmp"
+    # Trim trailing blank lines we may have just exposed, keep file tidy.
+    awk 'BEGIN{n=0} {a[NR]=$0} END{i=NR; while(i>0 && a[i]==""){i--}; for(j=1;j<=i;j++) print a[j]}' "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+# Write the block fresh. $1 = rc file, $2 = completion file extension
+# (zsh or bash). Block is plain POSIX-sh so it's safe in either shell.
+write_block() {
+    local file="$1"
+    local ext="$2"
+    local completion="$SCRIPT_DIR/scripts/t2l-complete.${ext}"
+    {
+        echo ""
+        echo "$BEGIN_LINE"
+        echo "# Managed by setup.sh in $SCRIPT_DIR — safe to delete; re-run ./setup.sh to restore."
+        echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "[ -f \"$completion\" ] && . \"$completion\""
+        echo "$END_LINE"
+    } >> "$file"
+}
+
+substep "Symlink $T2L_LINK → $T2L_SRC"
+mkdir -p "$BIN_DIR"
+if [[ -L "$T2L_LINK" ]]; then
+    current="$(readlink "$T2L_LINK")"
+    if [[ "$current" == "$T2L_SRC" ]]; then
+        ok "Symlink already points at this checkout."
+    else
+        info "Existing symlink points elsewhere ($current) — refreshing."
+        ln -sfn "$T2L_SRC" "$T2L_LINK"
+        ok "Symlink updated."
+    fi
+elif [[ -e "$T2L_LINK" ]]; then
+    warn "$T2L_LINK exists and is NOT a symlink."
+    if prompt_yn "Replace it with a symlink to $T2L_SRC?" "y"; then
+        rm -f "$T2L_LINK"
+        ln -sfn "$T2L_SRC" "$T2L_LINK"
+        ok "Replaced."
+    else
+        fail "Refusing to clobber. The t2l command will not be on PATH."
+    fi
+else
+    ln -sfn "$T2L_SRC" "$T2L_LINK"
+    ok "Symlink created."
+fi
+
+substep "Wire up your shell rc (PATH + tab-completion)"
+USER_SHELL="${SHELL##*/}"
+info "Detected login shell: $USER_SHELL"
+
+# Pick rc files. We write to whichever match $SHELL but also pick up the
+# other one if it exists, so switching shells later still works.
+RC_FILES=()
+if [[ "$USER_SHELL" == "zsh" || -f "$HOME/.zshrc" ]]; then
+    RC_FILES+=("$HOME/.zshrc:zsh")
+fi
+if [[ "$USER_SHELL" == "bash" ]]; then
+    # bash login shells on macOS read .bash_profile; .bashrc elsewhere.
+    if [[ "$PLATFORM" == "macOS" && -f "$HOME/.bash_profile" ]]; then
+        RC_FILES+=("$HOME/.bash_profile:bash")
+    elif [[ -f "$HOME/.bashrc" ]]; then
+        RC_FILES+=("$HOME/.bashrc:bash")
+    elif [[ "$PLATFORM" == "macOS" ]]; then
+        RC_FILES+=("$HOME/.bash_profile:bash")
+    else
+        RC_FILES+=("$HOME/.bashrc:bash")
+    fi
+elif [[ -f "$HOME/.bashrc" ]]; then
+    # User is on zsh but has a .bashrc around — keep it in sync defensively.
+    RC_FILES+=("$HOME/.bashrc:bash")
+fi
+
+if (( ${#RC_FILES[@]} == 0 )); then
+    warn "Couldn't figure out which shell rc to edit. Add this line to it manually:"
+    info "    [ -f \"$SCRIPT_DIR/scripts/t2l-complete.$USER_SHELL\" ] && . \"$SCRIPT_DIR/scripts/t2l-complete.$USER_SHELL\""
+else
+    for entry in "${RC_FILES[@]}"; do
+        file="${entry%%:*}"
+        ext="${entry##*:}"
+        touch "$file"
+        strip_block "$file"
+        write_block "$file" "$ext"
+        ok "Updated $file"
+    done
+fi
+
+substep "Activate the changes in this shell session"
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    info "Your current shell still has the old PATH. To use 't2l' right now"
+    info "without opening a new terminal, run:"
+    echo ""
+    if [[ "$USER_SHELL" == "zsh" ]]; then
+        echo "    source ~/.zshrc"
+    elif [[ "$USER_SHELL" == "bash" && "$PLATFORM" == "macOS" ]]; then
+        echo "    source ~/.bash_profile"
+    elif [[ "$USER_SHELL" == "bash" ]]; then
+        echo "    source ~/.bashrc"
+    else
+        echo "    exec \$SHELL -l"
+    fi
+    echo ""
+else
+    ok "$BIN_DIR is already on this shell's PATH — try: t2l --help"
+fi
+
+# ============================================================================
+# Step 3 — Install dependencies
 # ============================================================================
 step "Install dependencies"
 
@@ -222,7 +370,7 @@ else
 fi
 
 # ============================================================================
-# Step 3 — Backend env
+# Step 4 — Backend env
 # ============================================================================
 step "Backend env (backend/.env)"
 
@@ -249,7 +397,7 @@ else
 fi
 
 # ============================================================================
-# Step 4 — Mobile env via GCP Secret Manager
+# Step 5 — Mobile env via GCP Secret Manager
 # ============================================================================
 step "Mobile env (GCP Secret Manager)"
 
@@ -422,7 +570,7 @@ else
 fi
 
 # ============================================================================
-# Step 5 — Bring up the dev stack
+# Step 6 — Bring up the dev stack
 # ============================================================================
 step "Start the dev stack"
 
@@ -439,7 +587,7 @@ else
 fi
 
 # ============================================================================
-# Step 6 — First-time iOS dev build
+# Step 7 — First-time iOS dev build
 # ============================================================================
 step "First-time iOS dev build (mobile app)"
 
@@ -450,7 +598,7 @@ info "starts Metro and you tap the installed app on the simulator."
 echo ""
 
 if [[ ! -f apps/mobile/.env ]]; then
-    warn "apps/mobile/.env doesn't exist yet — skip step 4 of setup first, then"
+    warn "apps/mobile/.env doesn't exist yet — run step 5 of setup first, then"
     warn "re-run this script to do the iOS build."
 elif [[ "$PLATFORM" != "macOS" ]]; then
     warn "iOS builds require macOS + Xcode — skipping on $PLATFORM."
@@ -486,19 +634,20 @@ echo "${BOLD}${GREEN}  All done.${RESET}"
 echo "${BOLD}${GREEN}══════════════════════════════════════════════════════════════${RESET}"
 echo ""
 echo "${BOLD}Next:${RESET}"
-echo "  ${DIM}# Web (in another terminal):${RESET}"
-echo "  npm run dev:web                    # http://localhost:5173"
+echo "  ${DIM}# Everything in one CLI (tab-complete the subcommands):${RESET}"
+echo "  t2l --help                         ${DIM}list every command${RESET}"
+echo "  t2l up be                          ${DIM}local backend (mysql + api in Docker)${RESET}"
+echo "  t2l up fe                          ${DIM}local web on http://localhost:5173${RESET}"
+echo "  t2l up ios                         ${DIM}Expo Metro for the mobile app${RESET}"
+echo "  t2l deploy app --ota --message     ${DIM}OTA update via EAS Update${RESET}"
 echo ""
-echo "  ${DIM}# Mobile — first build (one-time, ~5–10 min):${RESET}"
-echo "  npm run build:ios:mobile           # builds + installs on iPhone simulator"
-echo ""
-echo "  ${DIM}# Mobile — day-to-day (Metro only; tap the installed app):${RESET}"
-echo "  npm run dev:mobile"
+echo "  ${DIM}# If 't2l' isn't found yet, open a new terminal or:${RESET}"
+echo "  source ~/.zshrc                    ${DIM}(or ~/.bash_profile / ~/.bashrc)${RESET}"
 echo ""
 echo "${BOLD}Docs:${RESET}"
-echo "  README.md                          ${DIM}top-level overview${RESET}"
+echo "  README.md                          ${DIM}top-level overview + CLI reference${RESET}"
 echo "  apps/mobile/README.md              ${DIM}mobile setup + dev-build workflow${RESET}"
-echo "  make help                          ${DIM}full target list${RESET}"
+echo "  make help                          ${DIM}lower-level Make targets${RESET}"
 echo ""
-echo "${BOLD}Re-run anytime:${RESET}  ./setup.sh"
+echo "${BOLD}Re-run anytime:${RESET}  ./setup.sh   ${DIM}(refreshes the t2l install + completion)${RESET}"
 echo ""
