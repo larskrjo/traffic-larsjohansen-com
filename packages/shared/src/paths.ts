@@ -11,6 +11,13 @@
  */
 export type ApiPaths = {
     readonly me: string;
+    /**
+     * Account deletion (Apple App Review 5.1.1(v) requirement). Same
+     * URL as `me` — the HTTP method (DELETE vs GET) disambiguates,
+     * and the shared `deleteAccount()` helper hides that detail from
+     * UI code.
+     */
+    readonly deleteAccount: string;
     readonly authGoogle: string;
     readonly authApple: string;
     readonly authLogout: string;
@@ -28,6 +35,7 @@ export type ApiPaths = {
 export function createApiPaths(baseUrl: string): ApiPaths {
     return {
         me: `${baseUrl}/api/v1/me`,
+        deleteAccount: `${baseUrl}/api/v1/me`,
         authGoogle: `${baseUrl}/api/v1/auth/google`,
         authApple: `${baseUrl}/api/v1/auth/apple`,
         authLogout: `${baseUrl}/api/v1/auth/logout`,

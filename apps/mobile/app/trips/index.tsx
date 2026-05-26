@@ -46,7 +46,6 @@ import {
 } from "@time2leave/shared";
 
 import { apiFetch, getApi } from "~/api/client";
-import { useAuth } from "~/auth/AuthProvider";
 import { GlassPill, ScrollEdgeFade } from "~/components/native/Glass";
 import { IOSStatusPill } from "~/components/native/StatusPill";
 import { Symbol } from "~/components/native/Symbol";
@@ -56,7 +55,6 @@ export default function TripList() {
     const insets = useSafeAreaInsets();
     const router = useRouter();
     const queryClient = useQueryClient();
-    const { signOut } = useAuth();
 
     const tripsQuery = useQuery({
         queryKey: ["trips"],
@@ -144,11 +142,11 @@ export default function TripList() {
             <Stack.Screen
                 options={{
                     headerRight: () => (
-                        <Tooltip title="Sign out">
+                        <Tooltip title="Settings">
                             <Pressable
-                                onPress={() => void signOut()}
+                                onPress={() => router.push("/trips/settings")}
                                 accessibilityRole="button"
-                                accessibilityLabel="Sign out"
+                                accessibilityLabel="Open settings"
                                 hitSlop={12}
                                 style={({ pressed }) => ({
                                     opacity: pressed ? 0.5 : 1,
@@ -158,8 +156,8 @@ export default function TripList() {
                             >
                                 <Symbol
                                     name={{
-                                        ios: "rectangle.portrait.and.arrow.right",
-                                        android: "logout",
+                                        ios: "gearshape",
+                                        android: "cog-outline",
                                     }}
                                     size={22}
                                     color={theme.colors.primary}

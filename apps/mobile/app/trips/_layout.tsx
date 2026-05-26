@@ -125,6 +125,14 @@ export default function TripsLayout() {
                     headerLargeTitle: false,
                 }}
             />
+            <Stack.Screen
+                name="settings"
+                options={{
+                    title: "Settings",
+                    presentation: "modal",
+                    headerLargeTitle: false,
+                }}
+            />
         </Stack>
     );
 }

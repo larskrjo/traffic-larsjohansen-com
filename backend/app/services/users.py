@@ -186,6 +186,41 @@ def upsert_user_from_apple(
     return _row_to_user(refreshed)
 
 
+def delete_user(user_id: int) -> bool:
+    """Hard-delete a user row and everything that hangs off it.
+
+    Returns True if a row was deleted, False if no row matched
+    (idempotent — the caller can keep retrying without a separate
+    "still there?" probe).
+
+    `users.id` is the FK target of three CASCADE relationships
+    (`trips`, `trip_mutation_log`, `commute_samples` via `trips`),
+    so a single DELETE on this table atomically removes the user's
+    trips, their per-week commute samples, and their mutation
+    audit log — i.e. every row in the database that's tied to them.
+
+    Auth-state implications worth knowing:
+      * Existing session JWTs (cookie + bearer) keep their crypto
+        signature valid until `exp`, but `get_optional_user` does
+        a `get_user_by_id` lookup on every request and returns
+        None when the row is gone — so a stale token degrades to
+        anonymous (401 on protected routes) immediately, without
+        needing a server-side blocklist.
+      * The user can re-sign-in with the same email + provider
+        and we'll INSERT a new row with a fresh `id`. The
+        previous trips / samples / audit log do NOT come back —
+        that's the point of "delete my account".
+      * The email stays on `auth_allowlist` (which is gated by
+        the operator, not by user action), so a deleted user
+        who's still on the allowlist can re-create their account
+        on next sign-in. Deliberate — allowlist management is an
+        operator's job, not a self-service path.
+    """
+    with Database() as cursor:
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        return cursor.rowcount > 0
+
+
 def _row_to_user(row: tuple) -> User:
     return User(
         id=int(row[0]),

@@ -27,5 +27,6 @@ export const ROUTES = {
     trips: "/trips",
     newTrip: "/trips/new",
     trip: (id: string) => `/trips/${id}`,
+    settings: "/settings",
     adminAllowlist: "/admin/allowlist",
 } as const;

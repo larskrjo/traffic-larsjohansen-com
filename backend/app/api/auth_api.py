@@ -32,6 +32,7 @@ from app.services.allowlist import is_email_allowed
 from app.services.users import (
     AppleIdentityWithoutLinkError,
     User,
+    delete_user,
     get_user_by_email,
     upsert_user_from_apple,
     upsert_user_from_google,
@@ -308,6 +309,44 @@ async def get_me(
     if user is None:
         return {"user": None}
     return _serialize_user(user, settings)
+
+
+@auth_router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_me(
+    response: Response,
+    user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """Permanently delete the authenticated user and all their data.
+
+    Effects, atomically:
+      * `users` row removed.
+      * All their `trips` removed (CASCADE).
+      * All `commute_samples` for those trips removed (CASCADE via
+        `trips.id` -> `commute_samples.trip_id`).
+      * All `trip_mutation_log` rows for the user removed (CASCADE).
+      * Session cookie cleared on the response. A stale bearer
+        token kept by a mobile client also degrades to anonymous
+        on the next request because the underlying user row is
+        gone (see `delete_user` docstring).
+
+    This endpoint exists so the mobile + web "Delete account"
+    flows have one server-side call to make. It's a hard
+    requirement of Apple App Review (Guideline 5.1.1(v), "apps
+    that support account creation must offer account deletion in
+    app") — without this route, every iOS submission gets
+    rejected.
+
+    Idempotency: the route returns 204 whether or not the row
+    actually existed at the moment of the DELETE — a duplicate
+    request from a confused client is indistinguishable from a
+    successful first one, which is what the UI wants.
+    """
+    delete_user(user.id)
+    clear_session_cookie(response, settings)
+    logger.info("Deleted account for user id=%s email=%s", user.id, user.email)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @auth_router.get("/auth/config")

@@ -28,6 +28,7 @@ import {
 } from "react";
 
 import {
+    deleteAccount as sharedDeleteAccount,
     fetchAuthConfig as sharedFetchAuthConfig,
     fetchMe as sharedFetchMe,
     isApiError,
@@ -62,6 +63,23 @@ type AuthContextValue = {
     ) => Promise<SessionUser>;
     signInDev: (email: string, name?: string) => Promise<SessionUser>;
     signOut: () => Promise<void>;
+    /**
+     * Permanently delete the signed-in user's account on the backend
+     * (DELETE /api/v1/me) AND clear every scrap of local state, the
+     * same way `signOut` does. The provider transitions to
+     * `anonymous` synchronously on the way out so the route guard in
+     * `apps/mobile/app/trips/_layout.tsx` redirects to the splash on
+     * the next render — no manual `router.replace` needed.
+     *
+     * Errors from the backend call are *re-thrown* (not swallowed
+     * the way `signOut` swallows them) so the calling Settings screen
+     * can show a "delete failed" message and let the user retry. We
+     * only clear local state on success.
+     *
+     * Required by Apple App Review Guideline 5.1.1(v) — every iOS
+     * submission gets rejected without this path.
+     */
+    deleteAccount: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -197,6 +215,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setStatus("anonymous");
     }, []);
 
+    const deleteAccount = useCallback(async () => {
+        // Server-side deletion is intentionally *not* best-effort: if
+        // the DELETE fails (e.g. offline, 401 because the bearer
+        // expired between the user opening Settings and tapping the
+        // button) we re-throw so the Settings screen can show "We
+        // couldn't delete your account, try again." rather than
+        // silently signing the user out while their data lives on
+        // forever in the backend.
+        await sharedDeleteAccount(apiFetch, getApi());
+        // Identical to `signOut` from here down: drop the bearer
+        // token, wipe secure storage, flip status. The route guard
+        // in `app/trips/_layout.tsx` then redirects to "/" on the
+        // next render.
+        setCurrentToken(null);
+        await clearStoredSession();
+        setUser(null);
+        setStatus("anonymous");
+    }, []);
+
     const value = useMemo<AuthContextValue>(
         () => ({
             status,
@@ -207,6 +244,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             signInWithApple,
             signInDev,
             signOut,
+            deleteAccount,
         }),
         [
             status,
@@ -217,6 +255,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             signInWithApple,
             signInDev,
             signOut,
+            deleteAccount,
         ],
     );
 

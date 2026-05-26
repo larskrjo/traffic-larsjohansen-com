@@ -29,9 +29,16 @@ def patched_app(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     from app.api import auth_api
 
     store: dict[str, User] = {}
+    # The real backend stores the allowlist in its own `auth_allowlist`
+    # table, independent of `users`. We model that here as a separate
+    # set so deleting a user (which only touches `users`) doesn't
+    # accidentally also drop the email from the allowlist — that's the
+    # property `test_delete_account_does_not_remove_email_from_allowlist`
+    # is asserting.
+    allowlist: set[str] = {"allowed@example.com", "admin@example.com"}
 
     def fake_is_email_allowed(email: str, *, settings) -> bool:  # noqa: ARG001
-        return email.lower() in store or email.lower() == "admin@example.com"
+        return email.lower() in allowlist
 
     def fake_upsert(identity: GoogleIdentity) -> User:
         user = User(
@@ -54,9 +61,26 @@ def patched_app(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
                 return u
         return None
 
+    def fake_delete_user(user_id: int) -> bool:
+        # Mirror the real service's signature: returns True iff a row
+        # was removed. We mutate `store` so subsequent fake lookups
+        # (`get_user_by_id`, `get_user_by_email`) honour the deletion
+        # — same effect as the CASCADE FKs in prod: from the
+        # application's point of view, the user is just *gone*.
+        target_email: str | None = None
+        for email, user in store.items():
+            if user.id == user_id:
+                target_email = email
+                break
+        if target_email is None:
+            return False
+        del store[target_email]
+        return True
+
     monkeypatch.setattr(auth_api, "is_email_allowed", fake_is_email_allowed)
     monkeypatch.setattr(auth_api, "upsert_user_from_google", fake_upsert)
     monkeypatch.setattr(auth_api, "get_user_by_email", fake_get_user_by_email)
+    monkeypatch.setattr(auth_api, "delete_user", fake_delete_user)
 
     from app.auth import dependencies as deps_mod
 
@@ -254,3 +278,110 @@ def test_non_bearer_authorization_scheme_is_ignored(
     )
     assert r.status_code == 200
     assert r.json() == {"user": None}
+
+
+# --- Account deletion ----------------------------------------------------
+# Apple App Review Guideline 5.1.1(v) requires every app that supports
+# account creation to also support in-app account deletion. The DELETE
+# /api/v1/me route is the single server-side hook the mobile + web
+# clients call.
+
+
+def test_delete_account_requires_auth(patched_app: TestClient) -> None:
+    """Anonymous callers can't nuke arbitrary accounts. 401, not 403 —
+    'go log in' is the right next-step message for the SPA."""
+    r = patched_app.delete("/api/v1/me")
+    assert r.status_code == 401
+
+
+def test_delete_account_wipes_user_and_clears_session(
+    patched_app: TestClient,
+) -> None:
+    """Happy path: signed-in user calls DELETE /me ->
+        * 204 No Content
+        * session cookie cleared on the response (so the browser
+          stops sending it on the next request)
+        * /me with the (now-stale) cookie returns anonymous, because
+          the user row no longer exists -> get_user_by_id returns
+          None -> get_optional_user returns None.
+    """
+    patched_app.post("/api/v1/auth/google", json={"credential": "good"})
+    assert "tlh_session" in patched_app.cookies
+
+    r = patched_app.delete("/api/v1/me")
+    assert r.status_code == 204, r.text
+    assert r.content == b""
+
+    # The Set-Cookie clearing instruction is what makes the web
+    # client forget the session as part of the same response.
+    set_cookies = r.headers.get_list("set-cookie")
+    assert any(
+        "tlh_session=" in c and ("Max-Age=0" in c or "expires=Thu, 01 Jan 1970" in c.lower())
+        for c in set_cookies
+    ), f"expected a clearing Set-Cookie, got {set_cookies!r}"
+
+    # Even without the clearing header (e.g. a mobile client that
+    # ignores cookies), the bearer token / cookie no longer
+    # resolves to a user because the row is gone.
+    me = patched_app.get("/api/v1/me")
+    assert me.status_code == 200
+    assert me.json() == {"user": None}
+
+
+def test_delete_account_with_bearer_token_invalidates_subsequent_requests(
+    patched_app: TestClient,
+) -> None:
+    """Mobile flow: log in with `X-Client: mobile` to get a JWT, hold
+    on to it, then DELETE /me with that bearer header. The next
+    request that presents the same (cryptographically still-valid)
+    bearer token is treated as anonymous because the underlying
+    user row no longer exists — same guarantee web gets via cookie
+    clearing, without needing a server-side blocklist."""
+    login = patched_app.post(
+        "/api/v1/auth/google",
+        json={"credential": "good"},
+        headers={"X-Client": "mobile"},
+    )
+    token = login.json()["session_token"]
+    assert token
+
+    auth = {"Authorization": f"Bearer {token}"}
+    # Sanity check: the bearer auths /me right now.
+    r0 = patched_app.get("/api/v1/me", headers=auth)
+    assert r0.status_code == 200
+    assert r0.json()["email"] == "allowed@example.com"
+
+    # Drop cookies so we're exclusively on the bearer path.
+    patched_app.cookies.clear()
+
+    r = patched_app.delete("/api/v1/me", headers=auth)
+    assert r.status_code == 204, r.text
+
+    # Stale-but-cryptographically-valid bearer should now degrade to
+    # anonymous on every subsequent request, with no extra server
+    # state needed (no JWT denylist, no Redis, nothing).
+    r2 = patched_app.get("/api/v1/me", headers=auth)
+    assert r2.status_code == 200
+    assert r2.json() == {"user": None}
+
+
+def test_delete_account_does_not_remove_email_from_allowlist(
+    patched_app: TestClient,
+) -> None:
+    """The allowlist is operator-controlled, not user-controlled.
+    Deleting your account leaves the email on the allowlist so the
+    *same person* can sign in again (with the same provider) and
+    get a fresh user row. The deleted trips / samples / audit log
+    do not come back — that's the contract."""
+    patched_app.post("/api/v1/auth/google", json={"credential": "good"})
+    r = patched_app.delete("/api/v1/me")
+    assert r.status_code == 204
+
+    # Same provider + same email -> fresh user row (note: in the
+    # real backend this is a brand-new `id`; the fake `upsert`
+    # increments by len(store)+1 which now equals 1 again because
+    # the dict was emptied. The behaviour we care about is that
+    # sign-in *succeeds*, not the specific id.)
+    r2 = patched_app.post("/api/v1/auth/google", json={"credential": "good"})
+    assert r2.status_code == 200
+    assert r2.json()["email"] == "allowed@example.com"

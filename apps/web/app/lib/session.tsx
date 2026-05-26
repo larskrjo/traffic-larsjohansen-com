@@ -21,6 +21,7 @@ import {
 } from "react";
 
 import {
+    deleteAccount as sharedDeleteAccount,
     fetchAuthConfig as sharedFetchAuthConfig,
     fetchMe as sharedFetchMe,
     loginDev as sharedLoginDev,
@@ -45,6 +46,16 @@ type SessionState = {
     loginWithGoogleCredential: (credential: string) => Promise<SessionUser>;
     loginDev: (email: string, name?: string) => Promise<SessionUser>;
     logout: () => Promise<void>;
+    /**
+     * Permanently delete the signed-in user's account on the backend
+     * (DELETE /api/v1/me) and mirror the local state change `logout`
+     * would do. Errors are *re-thrown* (unlike `logout`, which swallows
+     * them) so the calling Settings page can surface "we couldn't
+     * delete your account, try again" instead of pretending to succeed
+     * while their data lives on. Required by Apple App Review
+     * Guideline 5.1.1(v); see also `apps/mobile/app/trips/settings.tsx`.
+     */
+    deleteAccount: () => Promise<void>;
 };
 
 const SessionContext = createContext<SessionState | null>(null);
@@ -112,6 +123,19 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         setStatus("anonymous");
     }, []);
 
+    const deleteAccount = useCallback(async () => {
+        // Intentionally NOT best-effort. If the DELETE fails (e.g.
+        // 401 because the cookie expired, 500 from a backend hiccup),
+        // we re-throw so the Settings page renders an error banner
+        // and the user can retry. Local state is only cleared on
+        // success — leaving a half-deleted local view while the
+        // backend still has all the data would be worse than the
+        // current "nothing happened" state.
+        await sharedDeleteAccount(apiFetch, API);
+        setUser(null);
+        setStatus("anonymous");
+    }, []);
+
     const value = useMemo<SessionState>(
         () => ({
             status,
@@ -121,6 +145,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             loginWithGoogleCredential,
             loginDev,
             logout,
+            deleteAccount,
         }),
         [
             status,
@@ -130,6 +155,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
             loginWithGoogleCredential,
             loginDev,
             logout,
+            deleteAccount,
         ],
     );
 

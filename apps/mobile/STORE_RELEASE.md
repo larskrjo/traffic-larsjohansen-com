@@ -138,6 +138,12 @@ backend is allowlist-gated. Add an Apple-Review-only allowlist entry
 this section. Reviewers will sign in with Apple using a test Apple ID
 whose email is on the allowlist.
 
+**Google Play Data Safety → "Users can request that data is deleted"**
+must be ticked **Yes**. The in-app path is documented in §7
+("Account deletion"); the matching web path lives at
+`https://time2leave.com/settings` so users who only use the SPA can
+delete their account too.
+
 ## 4. EAS environment variables
 
 `apps/mobile/.env` is gitignored and lives only on the developer's
@@ -271,7 +277,55 @@ new installs will see it for one launch before the OTA arrives, which
 is a terrible first-run experience. For env / config changes that
 affect first launch, do a proper `eas build` + `eas submit` cycle.
 
-## 7. Post-launch
+## 7. Account deletion (Apple Guideline 5.1.1(v))
+
+Apple App Review will *reject* any iOS app with account creation that
+doesn't also offer in-app account deletion. Time2Leave ships an
+end-to-end delete-account flow:
+
+- **Mobile**: `apps/mobile/app/trips/settings.tsx`. Reached from the
+  trips list via the gear icon in the nav bar (top right). Section
+  "Danger zone → Delete account" → iOS double-confirm Alert → calls
+  `useAuth().deleteAccount()`, which hits `DELETE /api/v1/me`.
+- **Web**: `apps/web/app/routes/settings.tsx` at `/settings`.
+  Reached from the user-menu (avatar in the top right) → "Settings".
+  Section "Danger zone" → "Delete account" → type-confirmation dialog
+  (must type `DELETE`) → calls `useSession().deleteAccount()`, which
+  hits the same `DELETE /api/v1/me`.
+- **Backend**: `DELETE /api/v1/me` (`backend/app/api/auth_api.py`)
+  calls `delete_user(user.id)` (`backend/app/services/users.py`).
+  Cascade FKs do the rest: `users.id` is the FK target of
+  `trips.user_id`, `trip_mutation_log.user_id`, and (via `trips.id`)
+  `commute_samples.trip_id`, all with `ON DELETE CASCADE`. So one
+  DELETE atomically removes the user, every trip they ever saved,
+  every drive-time sample for those trips, and the full mutation
+  audit log.
+
+What deletion does NOT do (intentionally):
+- It does **not** remove the email from `auth_allowlist`. That's
+  operator-controlled; if the same person signs in again with the
+  same provider, they get a fresh `users` row (with a new `id`) and
+  no historical data. If you want them genuinely locked out you
+  must remove them from the allowlist via the admin UI / API too.
+- It does **not** add the JWT to a server-side blocklist. Stateless
+  JWTs stay cryptographically valid until `exp`, but every protected
+  route runs `get_user_by_id` on the claim's `uid` — which returns
+  None once the row is gone — so stale tokens degrade to anonymous
+  (401) on the next request.
+
+App Review note copy (paste into App Store Connect → App Review
+Information → Notes):
+
+```
+Account deletion: After sign-in, tap the gear icon in the top-right
+of the Trips screen to open Settings. The "Danger zone" section at
+the bottom has a "Delete account" button. Confirm twice and the
+account is permanently deleted, all trips and history are removed,
+and the user is signed out automatically. No email or support
+contact is required.
+```
+
+## 8. Post-launch
 
 - Bump `version` in [`app.config.ts`](app.config.ts) per release.
   `runtimeVersion.policy = "appVersion"` ties OTA compatibility to

@@ -24,6 +24,7 @@ import {
 import {
     LockPersonRounded,
     LogoutRounded,
+    SettingsRounded,
 } from "@mui/icons-material";
 import { Link as RouterLink, useNavigate } from "react-router";
 
@@ -203,6 +204,18 @@ export function AppShell({ children }: { children: ReactNode }) {
                                             </Box>
                                         )}
                                         <Divider sx={{ my: 0.5 }} />
+                                        <MenuItem
+                                            component={RouterLink}
+                                            to={ROUTES.settings}
+                                            onClick={() => setAnchor(null)}
+                                        >
+                                            <ListItemIcon>
+                                                <SettingsRounded fontSize="small" />
+                                            </ListItemIcon>
+                                            <ListItemText>
+                                                Settings
+                                            </ListItemText>
+                                        </MenuItem>
                                         <MenuItem onClick={handleLogout}>
                                             <ListItemIcon>
                                                 <LogoutRounded fontSize="small" />

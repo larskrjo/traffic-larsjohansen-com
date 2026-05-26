@@ -115,3 +115,26 @@ export async function logout(
         method: "POST",
     });
 }
+
+/**
+ * Permanently delete the signed-in user's account and every row that
+ * hangs off it (trips, samples, audit log). On success the backend
+ * clears the session cookie as part of the response, and a stale
+ * bearer token kept on a mobile client degrades to anonymous on the
+ * next request because the underlying user row no longer exists.
+ *
+ * The caller is responsible for the *client-side* cleanup that
+ * mirrors a regular sign-out (clearing any in-memory user state,
+ * dropping any bearer token from secure storage, navigating back to
+ * the splash). This helper just makes the DELETE.
+ *
+ * Apple App Review 5.1.1(v) requires this path to exist on any app
+ * that supports account creation, which we do via "Sign in with
+ * Apple" — so the App Store submission is wired to this endpoint.
+ */
+export async function deleteAccount(
+    apiFetch: ApiFetch,
+    paths: ApiPaths,
+): Promise<void> {
+    await apiFetch<null>(paths.deleteAccount, { method: "DELETE" });
+}
