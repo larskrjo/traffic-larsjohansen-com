@@ -325,6 +325,48 @@ and the user is signed out automatically. No email or support
 contact is required.
 ```
 
+## 7a. Reviewer cost guard (no Google Maps spend during review)
+
+Every trip create or address edit normally triggers a ~1,680-call
+Routes Matrix backfill (~$16.80 in Google Maps spend) plus a
+Geocoding pre-flight per address. During App Review the reviewer
+will exercise the create-trip / delete-account / re-create flow
+repeatedly, which would otherwise drain real API budget.
+
+**The mechanism:** the backend reads a `REVIEW_ACCOUNT_EMAILS`
+comma-separated env var (configured in `backend/docker-compose.yml`).
+Trips owned by any listed email are transparently routed to the
+deterministic `FixtureProvider` (no Google network calls, no spend)
+and skip the Geocoding pre-flight entirely. The reviewer sees the
+same UX as a real user — heatmap fills in, delete works, re-create
+works — but the operator pays $0 for the review session.
+
+Edge behavior worth knowing:
+
+- Allowlist entries persist across deletions (the email stays in
+  `auth_allowlist` even when the user row is gone), so the reviewer
+  can re-create their account as many times as they want.
+- The weekly Mon 01:00 PT cron filters out reviewer-owned trips
+  before planning, so a reviewer who leaves a trip active over a
+  Monday doesn't trigger 840 weekly calls. The on-demand
+  on-create backfill (which is what actually fills the heatmap
+  the reviewer sees) runs against the FixtureProvider regardless.
+- Non-reviewer emails are completely unaffected — the global
+  `data_provider=google` setting still routes real users to the
+  real Routes API.
+
+**Operator checklist before each App Review submission:**
+
+1. Confirm `REVIEW_ACCOUNT_EMAILS` in `backend/docker-compose.yml`
+   includes the reviewer email you'll hand to Apple (currently
+   `my.app.store.reviewer@gmail.com`).
+2. Confirm that same email is on `auth_allowlist` in production
+   (one-time bootstrap via the admin endpoint; persists indefinitely).
+3. After deploy, sign in with the reviewer account and create
+   one trip — confirm the heatmap fills in (proves
+   FixtureProvider is wired). If it stays "Building… 0 / 0",
+   the env var likely didn't propagate; redeploy backend.
+
 ## 8. Post-launch
 
 - Bump `version` in [`app.config.ts`](app.config.ts) per release.

@@ -11,6 +11,7 @@ from app.job.providers import (
     FixtureProvider,
     GoogleRoutesProvider,
     get_provider,
+    provider_for_user_email,
 )
 
 
@@ -117,3 +118,67 @@ class TestGetProvider:
             )
         )
         assert isinstance(p, GoogleRoutesProvider)
+
+
+class TestProviderForUserEmail:
+    """`provider_for_user_email` is the per-trip choke point that
+    short-circuits Google Maps spend for App Store / Play Store
+    reviewers. It must:
+
+      * route reviewer emails to FixtureProvider regardless of
+        global `data_provider`,
+      * route non-reviewer emails through the global provider
+        unchanged,
+      * be case-insensitive on the email match,
+      * handle missing emails (None / "") safely.
+    """
+
+    @staticmethod
+    def _google_settings(reviewers: list[str] | None = None) -> Settings:
+        return Settings(
+            app_env="local",
+            data_provider="google",
+            google_maps_api_key="abc",
+            review_account_emails=reviewers or [],
+        )
+
+    def test_reviewer_overrides_google(self):
+        s = self._google_settings(["my.app.store.reviewer@gmail.com"])
+        p = provider_for_user_email("my.app.store.reviewer@gmail.com", s)
+        assert isinstance(p, FixtureProvider)
+
+    def test_reviewer_match_is_case_insensitive(self):
+        s = self._google_settings(["my.app.store.reviewer@gmail.com"])
+        p = provider_for_user_email("My.App.Store.Reviewer@GMAIL.com", s)
+        assert isinstance(p, FixtureProvider)
+
+    def test_non_reviewer_uses_global_provider(self):
+        s = self._google_settings(["my.app.store.reviewer@gmail.com"])
+        p = provider_for_user_email("real.user@example.com", s)
+        assert isinstance(p, GoogleRoutesProvider)
+
+    def test_empty_reviewer_list_uses_global_provider(self):
+        s = self._google_settings([])
+        p = provider_for_user_email("anyone@example.com", s)
+        assert isinstance(p, GoogleRoutesProvider)
+
+    def test_none_email_falls_back_to_global_provider(self):
+        s = self._google_settings(["my.app.store.reviewer@gmail.com"])
+        p = provider_for_user_email(None, s)
+        assert isinstance(p, GoogleRoutesProvider)
+
+    def test_empty_email_falls_back_to_global_provider(self):
+        s = self._google_settings(["my.app.store.reviewer@gmail.com"])
+        p = provider_for_user_email("", s)
+        assert isinstance(p, GoogleRoutesProvider)
+
+    def test_local_fixture_provider_unchanged_for_non_reviewer(self):
+        # If the operator is already on fixture, reviewer logic is
+        # a no-op — but we still want a FixtureProvider back.
+        s = Settings(
+            app_env="local",
+            data_provider="fixture",
+            review_account_emails=["my.app.store.reviewer@gmail.com"],
+        )
+        p = provider_for_user_email("real.user@example.com", s)
+        assert isinstance(p, FixtureProvider)

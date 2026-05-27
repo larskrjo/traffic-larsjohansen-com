@@ -99,6 +99,31 @@ def is_admin(user: User, settings: Settings) -> bool:
     return user.email.lower() in {a.lower() for a in settings.admin_emails}
 
 
+def is_review_account_email(email: str | None, settings: Settings) -> bool:
+    """Return True iff `email` belongs to a configured App Store / Play
+    Store reviewer account.
+
+    Reviewer accounts run on the deterministic `FixtureProvider` and
+    skip the Geocoding pre-flight so that the create-trip / delete-
+    account / re-create-trip loop reviewers exercise during App Store
+    review costs $0 instead of $16.80/cycle in Google Maps spend.
+
+    `email` is `Optional` so callers that have only `user.email` (a
+    `str`) and callers that have raw DB values (which could in theory
+    be None) can both feed it in safely. Comparison is case-insensitive
+    because `settings.review_account_emails` is already lowercased by
+    the `_split_email_lists` validator.
+    """
+    if not email:
+        return False
+    return email.lower() in {e.lower() for e in settings.review_account_emails}
+
+
+def is_review_account(user: User, settings: Settings) -> bool:
+    """`User`-typed convenience wrapper around `is_review_account_email`."""
+    return is_review_account_email(user.email, settings)
+
+
 def get_admin_user(
     user: User = Depends(get_current_user),
     settings: Settings = Depends(get_settings),

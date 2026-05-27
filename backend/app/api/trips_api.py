@@ -17,10 +17,11 @@ from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.auth.dependencies import get_current_user, is_admin
+from app.auth.dependencies import get_current_user, is_admin, is_review_account
 from app.config import Settings, get_settings
 from app.services.address_validation import (
     AddressValidator,
+    NullAddressValidator,
     get_address_validator,
 )
 from app.services.trip_mutations import (
@@ -192,6 +193,21 @@ def _validate_addresses_or_400(
             )
 
 
+def _address_validator_for(user: User, settings: Settings) -> AddressValidator:
+    """Pick the validator to use for this user's trip mutation.
+
+    Reviewer accounts skip the Geocoding pre-flight too. The pre-flight
+    is cheap (~$0.005/address) but reviewers may legitimately type test
+    strings ("address 1", "home", etc.) that Google would reject — and
+    the downstream Routes Matrix calls are already FixtureProvider'd,
+    so there's no expensive backfill to protect anyway. Letting any
+    string through removes a friction point during App Store review.
+    """
+    if is_review_account(user, settings):
+        return NullAddressValidator()
+    return get_address_validator(settings)
+
+
 def _ensure_current_week_backfill(
     trip_id: int, background_tasks: BackgroundTasks
 ) -> None:
@@ -288,10 +304,12 @@ async def create_my_trip(
         raise _raise_mutation_quota_429(exc) from exc
 
     # Cheap Geocoding pre-flight so we don't burn ~840 Routes Matrix
-    # calls on a garbage address. No-op in dev / with fixture provider.
+    # calls on a garbage address. No-op in dev / with fixture provider,
+    # and no-op for review accounts (FixtureProvider downstream means
+    # there's no Routes spend to protect).
     _validate_addresses_or_400(
         [("origin", origin), ("destination", destination)],
-        get_address_validator(settings),
+        _address_validator_for(user, settings),
     )
 
     try:
@@ -423,7 +441,7 @@ async def update_my_trip(
             )
         if to_validate:
             _validate_addresses_or_400(
-                to_validate, get_address_validator(settings)
+                to_validate, _address_validator_for(user, settings)
             )
 
     try:

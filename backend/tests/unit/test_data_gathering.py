@@ -552,3 +552,284 @@ class TestBackfillTripForWeek:
         )
 
         assert plan_calls == [dg.current_week_monday()]
+
+
+class TestReviewAccountShortCircuit:
+    """The two cost-control paths that fire for App Store / Play Store
+    reviewer accounts:
+
+      1. The weekly Monday 01:00 PT cron filters out reviewer-owned
+         trips before they ever reach `_plan_and_run`, so the cron
+         doesn't burn ~840 Routes Matrix calls/week per reviewer trip.
+      2. On-create / on-edit backfill (`backfill_trip_for_week`) routes
+         reviewer-owned trips to `FixtureProvider` when the caller
+         didn't pin a provider — even if `data_provider=google` is set
+         globally. The explicit `provider=` kwarg still wins so tests
+         that inject deterministic fakes keep working.
+    """
+
+    @staticmethod
+    def _trip(trip_id: int, user_id: int) -> Trip:
+        return Trip(
+            id=trip_id,
+            slug=f"slug-{trip_id:05d}",
+            user_id=user_id,
+            name=f"T{trip_id}",
+            origin_address="A",
+            destination_address="B",
+            created_at=None,
+        )
+
+    @staticmethod
+    def _stub_users(monkeypatch: pytest.MonkeyPatch, email_by_id: dict[int, str]) -> None:
+        """Patch `get_user_by_id` to look up emails from the given map.
+
+        Returns `None` for unknown ids so the helper exercises its
+        "owner row is gone" fallback too.
+        """
+        from app.services.users import User
+
+        def fake(user_id: int) -> User | None:
+            email = email_by_id.get(user_id)
+            if email is None:
+                return None
+            return User(
+                id=user_id,
+                google_sub=None,
+                apple_sub=None,
+                email=email,
+                name=None,
+                picture_url=None,
+            )
+
+        monkeypatch.setattr(dg, "get_user_by_id", fake)
+
+    def test_filter_drops_reviewer_trips(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings(
+            review_account_emails=["my.app.store.reviewer@gmail.com"]
+        )
+        self._stub_users(
+            monkeypatch,
+            {
+                1: "real.user@example.com",
+                2: "my.app.store.reviewer@gmail.com",
+                3: "another.real@example.com",
+            },
+        )
+
+        trips = [self._trip(101, 1), self._trip(102, 2), self._trip(103, 3)]
+        kept = dg._filter_out_review_account_trips(trips, settings)
+
+        assert [t.id for t in kept] == [101, 103]
+
+    def test_filter_is_a_noop_when_no_reviewers_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty list → no DB lookups, original list returned. This
+        keeps the cron path fast in environments that haven't
+        configured a reviewer (i.e. local / dev / forks)."""
+        settings = _settings(review_account_emails=[])
+
+        def fake_lookup(_user_id: int):
+            raise AssertionError("get_user_by_id should not be called")
+
+        monkeypatch.setattr(dg, "get_user_by_id", fake_lookup)
+
+        trips = [self._trip(101, 1), self._trip(102, 2)]
+        kept = dg._filter_out_review_account_trips(trips, settings)
+
+        assert kept == trips
+
+    def test_filter_keeps_trips_with_missing_owner_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If `get_user_by_id` returns None (race: user row deleted
+        mid-cron), the trip stays in the list so the existing
+        FK-cascade / orphan-trip logic in `_plan_and_run` handles it
+        uniformly — we don't silently drop trips on a missing owner."""
+        settings = _settings(
+            review_account_emails=["my.app.store.reviewer@gmail.com"]
+        )
+        self._stub_users(monkeypatch, {})  # every lookup returns None
+
+        trips = [self._trip(101, 1), self._trip(102, 2)]
+        kept = dg._filter_out_review_account_trips(trips, settings)
+
+        assert kept == trips
+
+    def test_main_skips_reviewer_trips_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`main()` (the weekly cron) must hand `_plan_and_run` a trip
+        list with reviewer-owned trips filtered out."""
+        settings = _settings(
+            review_account_emails=["my.app.store.reviewer@gmail.com"]
+        )
+        trips = [self._trip(101, 1), self._trip(102, 2)]
+        monkeypatch.setattr(dg, "list_active_trips", lambda: trips)
+        self._stub_users(
+            monkeypatch,
+            {
+                1: "real.user@example.com",
+                2: "my.app.store.reviewer@gmail.com",
+            },
+        )
+
+        plan_call_trips: list[list[Trip]] = []
+
+        def fake_plan(*, trips, **_kw):  # noqa: ARG001
+            plan_call_trips.append(list(trips))
+
+        monkeypatch.setattr(dg, "_plan_and_run", fake_plan)
+
+        dg.main(provider=_NoopProvider(), settings=settings)
+
+        assert len(plan_call_trips) == 1
+        assert [t.id for t in plan_call_trips[0]] == [101]
+
+    def test_backfill_routes_reviewer_to_fixture_provider_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the caller doesn't pin a provider AND `data_provider=google`,
+        a reviewer-owned trip still gets `FixtureProvider`."""
+        from app.job.providers import FixtureProvider, GoogleRoutesProvider
+
+        # data_provider=google with a key would normally pick
+        # GoogleRoutesProvider for everyone.
+        settings = _settings(
+            data_provider="google",
+            google_maps_api_key="abc",
+            review_account_emails=["my.app.store.reviewer@gmail.com"],
+        )
+
+        class _Cursor:
+            rowcount = 1
+            # SELECT order: id, slug, user_id, name, origin, dest, created_at
+            _row = (7, "slug-00007", 42, "T", "A", "B", None)
+
+            def execute(self, *_a, **_kw) -> None:
+                pass
+
+            def fetchone(self):
+                return self._row
+
+        class _DB:
+            def __enter__(self_inner):
+                return _Cursor()
+
+            def __exit__(self_inner, *exc) -> None:
+                return None
+
+        monkeypatch.setattr(dg, "Database", _DB)
+        self._stub_users(monkeypatch, {42: "my.app.store.reviewer@gmail.com"})
+
+        plan_providers: list[object] = []
+
+        def fake_plan(*, provider, **_kw):  # noqa: ARG001
+            plan_providers.append(provider)
+
+        monkeypatch.setattr(dg, "_plan_and_run", fake_plan)
+
+        dg.backfill_trip_for_week(7, date(2025, 12, 8), settings=settings)
+
+        assert len(plan_providers) == 1
+        assert isinstance(plan_providers[0], FixtureProvider)
+        assert not isinstance(plan_providers[0], GoogleRoutesProvider)
+
+    def test_backfill_routes_real_user_to_google_provider_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: a normal user with `data_provider=google`
+        still gets the real Google provider — reviewer logic must not
+        accidentally route everyone to FixtureProvider."""
+        from app.job.providers import GoogleRoutesProvider
+
+        settings = _settings(
+            data_provider="google",
+            google_maps_api_key="abc",
+            review_account_emails=["my.app.store.reviewer@gmail.com"],
+        )
+
+        class _Cursor:
+            rowcount = 1
+            _row = (8, "slug-00008", 99, "T", "A", "B", None)
+
+            def execute(self, *_a, **_kw) -> None:
+                pass
+
+            def fetchone(self):
+                return self._row
+
+        class _DB:
+            def __enter__(self_inner):
+                return _Cursor()
+
+            def __exit__(self_inner, *exc) -> None:
+                return None
+
+        monkeypatch.setattr(dg, "Database", _DB)
+        self._stub_users(monkeypatch, {99: "real.user@example.com"})
+
+        plan_providers: list[object] = []
+
+        def fake_plan(*, provider, **_kw):  # noqa: ARG001
+            plan_providers.append(provider)
+
+        monkeypatch.setattr(dg, "_plan_and_run", fake_plan)
+
+        dg.backfill_trip_for_week(8, date(2025, 12, 8), settings=settings)
+
+        assert len(plan_providers) == 1
+        assert isinstance(plan_providers[0], GoogleRoutesProvider)
+
+    def test_explicit_provider_kwarg_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tests / admin tooling that pass `provider=...` directly must
+        keep getting that provider — the reviewer fallback is only for
+        the default `provider=None` path."""
+        settings = _settings(
+            review_account_emails=["my.app.store.reviewer@gmail.com"]
+        )
+
+        class _Cursor:
+            rowcount = 1
+            _row = (9, "slug-00009", 1, "T", "A", "B", None)
+
+            def execute(self, *_a, **_kw) -> None:
+                pass
+
+            def fetchone(self):
+                return self._row
+
+        class _DB:
+            def __enter__(self_inner):
+                return _Cursor()
+
+            def __exit__(self_inner, *exc) -> None:
+                return None
+
+        monkeypatch.setattr(dg, "Database", _DB)
+
+        # Note: no user lookup is stubbed — when the caller pins
+        # provider= we must NOT do a user lookup (that's the contract).
+        def fake_lookup(_user_id: int):
+            raise AssertionError("get_user_by_id called despite explicit provider")
+
+        monkeypatch.setattr(dg, "get_user_by_id", fake_lookup)
+
+        explicit = _NoopProvider()
+        plan_providers: list[object] = []
+
+        def fake_plan(*, provider, **_kw):  # noqa: ARG001
+            plan_providers.append(provider)
+
+        monkeypatch.setattr(dg, "_plan_and_run", fake_plan)
+
+        dg.backfill_trip_for_week(
+            9, date(2025, 12, 8), provider=explicit, settings=settings
+        )
+
+        assert plan_providers == [explicit]

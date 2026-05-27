@@ -195,3 +195,34 @@ def get_provider(settings: Settings | None = None) -> CommuteProvider:
         return GoogleRoutesProvider(settings.google_maps_api_key)
 
     return FixtureProvider()
+
+
+def provider_for_user_email(
+    email: str | None, settings: Settings | None = None
+) -> CommuteProvider:
+    """Pick the provider to use for a trip owned by `email`.
+
+    Real users get `get_provider(settings)`. App Store / Play Store
+    reviewer accounts (`settings.review_account_emails`) get the
+    deterministic `FixtureProvider` regardless of `data_provider`, so
+    the create-trip / delete-account / re-create-trip loop they run
+    during review costs $0 in Google Maps spend.
+
+    Lazy import of the dependency helper to avoid a config↔auth import
+    cycle (auth.dependencies imports config; this module is reached
+    from the job layer that auth has no business knowing about).
+    """
+    settings = settings or get_settings()
+    # Lazy import: app.auth.dependencies → app.config, and this module
+    # is on the cron / API call path, so an unconditional import would
+    # create a cycle in some bootstraps.
+    from app.auth.dependencies import is_review_account_email
+
+    if is_review_account_email(email, settings):
+        logger.info(
+            "Routing trip for review account %s to FixtureProvider "
+            "(no Google Maps spend).",
+            email,
+        )
+        return FixtureProvider()
+    return get_provider(settings)

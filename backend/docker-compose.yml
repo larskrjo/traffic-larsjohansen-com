@@ -22,6 +22,12 @@ services:
       # email can sign in even before the table has any other rows.
       ADMIN_EMAILS: "larskrjo@gmail.com"
       AUTH_ALLOWLIST_BOOTSTRAP: "larskrjo@gmail.com"
+      # App Store / Play Store reviewer accounts. Trips owned by these
+      # emails run on FixtureProvider (no Google Maps spend) and skip
+      # the Geocoding pre-flight, so the reviewer's create-trip /
+      # delete-account / re-create loop costs $0 in API spend.
+      # Allowlist these emails separately via auth_allowlist for sign-in.
+      REVIEW_ACCOUNT_EMAILS: "my.app.store.reviewer@gmail.com"
     healthcheck:
       test: ["CMD-SHELL", "python healthcheck.py"]
       interval: 5s

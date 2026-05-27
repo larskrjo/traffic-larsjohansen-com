@@ -75,3 +75,29 @@ def test_google_oauth_client_ids_empty_when_unset():
 def test_google_oauth_client_ids_handles_single_value():
     s = Settings(google_oauth_client_id="only-one")
     assert s.google_oauth_client_ids == ["only-one"]
+
+
+def test_review_account_emails_splits_comma_separated(monkeypatch):
+    """Env-var carries multiple reviewer emails as a comma list,
+    matching the ADMIN_EMAILS / AUTH_ALLOWLIST_BOOTSTRAP convention."""
+    monkeypatch.setenv(
+        "REVIEW_ACCOUNT_EMAILS",
+        "my.app.store.reviewer@gmail.com , Play.Reviewer@Example.com",
+    )
+    reset_settings_cache()
+    s = get_settings()
+    assert s.review_account_emails == [
+        "my.app.store.reviewer@gmail.com",
+        "play.reviewer@example.com",
+    ]
+
+
+def test_review_account_emails_default_empty():
+    assert Settings().review_account_emails == []
+
+
+def test_review_account_emails_constructor_accepts_list():
+    """Programmatic construction (used in tests) should also accept a
+    list[str], not just the comma-separated env var form."""
+    s = Settings(review_account_emails=["A@B.com", "c@d.com"])
+    assert s.review_account_emails == ["a@b.com", "c@d.com"]

@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     auth_allowlist_bootstrap: Annotated[list[str], NoDecode] = Field(
         default_factory=list
     )
+    # App Store / Play Store reviewer accounts. Every trip create or
+    # address edit triggers a ~1,680-call Routes Matrix backfill
+    # (~$16.80) plus a Geocoding pre-flight per address; reviewers
+    # exercise create/delete flows repeatedly during review, which
+    # would otherwise drain the Google Maps budget. Trips owned by
+    # these emails get the deterministic `FixtureProvider` and a
+    # no-op address validator instead — same UX (heatmap fills in,
+    # delete works, re-create works), zero Google spend.
+    #
+    # Comma-separated env var (`REVIEW_ACCOUNT_EMAILS=foo@x,bar@y`).
+    # Empty by default outside of prod.
+    review_account_emails: Annotated[list[str], NoDecode] = Field(
+        default_factory=list
+    )
 
     # Per-user and global trip quotas. Admins (emails in `admin_emails`)
     # get the higher `max_trips_per_admin` so the operator can keep a
@@ -136,6 +150,7 @@ class Settings(BaseSettings):
     @field_validator(
         "admin_emails",
         "auth_allowlist_bootstrap",
+        "review_account_emails",
         mode="before",
     )
     @classmethod

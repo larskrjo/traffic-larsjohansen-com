@@ -62,8 +62,9 @@ from mysql.connector import Error
 
 from app.config import Settings, get_settings
 from app.db.db import Database, get_pool
-from app.job.providers import CommuteProvider, get_provider
+from app.job.providers import CommuteProvider, get_provider, provider_for_user_email
 from app.services.trips import TZ, Trip, list_active_trips
+from app.services.users import get_user_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +400,43 @@ def _plan_and_run(
     )
 
 
+def _filter_out_review_account_trips(
+    trips: list[Trip], settings: Settings
+) -> list[Trip]:
+    """Drop trips whose owner is a configured review account.
+
+    The weekly Monday 01:00 PT cron would otherwise spend ~840 Google
+    Maps Routes Matrix calls per reviewer trip every week of the year.
+    Reviewer trips don't need a cron refresh — when the reviewer
+    actually signs in and creates a trip, the on-create dual-week
+    backfill (already routed to FixtureProvider by `backfill_trip_for_week`)
+    fills the heatmap synchronously.
+
+    No-op when `review_account_emails` is empty (i.e. local / dev /
+    forks without an App Store review configured).
+    """
+    review_emails = {e.lower() for e in settings.review_account_emails}
+    if not review_emails:
+        return trips
+
+    keep: list[Trip] = []
+    skipped = 0
+    for trip in trips:
+        owner = get_user_by_id(trip.user_id)
+        if owner is not None and owner.email.lower() in review_emails:
+            skipped += 1
+            continue
+        keep.append(trip)
+    if skipped:
+        logger.info(
+            "Cron: skipped %s review-account trip(s) "
+            "(saves ~%s Routes Matrix calls).",
+            skipped,
+            skipped * slots_per_trip_per_week(settings),
+        )
+    return keep
+
+
 def main(
     provider: CommuteProvider | None = None,
     settings: Settings | None = None,
@@ -406,7 +444,7 @@ def main(
     """Weekly cron entry point (Mon 01:00 PT). Refreshes next week's data for every trip."""
     settings = settings or get_settings()
     provider = provider or get_provider(settings)
-    trips = list_active_trips()
+    trips = _filter_out_review_account_trips(list_active_trips(), settings)
     _plan_and_run(
         trips=trips,
         week_start=next_week_monday(),
@@ -427,9 +465,13 @@ def backfill_trip_for_week(
     We intentionally skip the global ceiling here because it's a single
     trip's worth of calls (~840), which is never going to be the problem
     — the Monday fleet-wide run is.
+
+    When the caller doesn't pin a provider, this picks one per-trip via
+    the owner's email so that App Store / Play Store reviewer accounts
+    transparently get the `FixtureProvider`. The `provider=` kwarg still
+    wins when set (tests use it to inject deterministic fakes).
     """
     settings = settings or get_settings()
-    provider = provider or get_provider(settings)
 
     with Database() as cursor:
         cursor.execute(
@@ -461,6 +503,11 @@ def backfill_trip_for_week(
         destination_address=row[5],
         created_at=row[6],
     )
+
+    if provider is None:
+        owner = get_user_by_id(trip.user_id)
+        owner_email = owner.email if owner is not None else None
+        provider = provider_for_user_email(owner_email, settings)
 
     _plan_and_run(
         trips=[trip],

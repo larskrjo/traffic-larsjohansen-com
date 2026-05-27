@@ -637,6 +637,205 @@ def test_patch_trip_validates_only_changed_origin(
     assert stub.calls == ["junk"]
 
 
+class TestReviewAccountBypassesGeocoding:
+    """Reviewer accounts skip the Geocoding pre-flight.
+
+    A reviewer is going to be typing test addresses ("address 1",
+    "home", "1234") during App Store review. With the prod
+    `GoogleGeocodingValidator`, those would all 400 with "couldn't
+    find that on Google Maps" — friction that doesn't apply to the
+    cost-protection goal (the downstream Routes Matrix backfill is
+    already FixtureProvider'd by `provider_for_user_email`).
+
+    These tests prove the validator swap fires for reviewer emails
+    and that it doesn't accidentally fire for everyone else.
+    """
+
+    @pytest.fixture
+    def reviewer_user(self) -> User:
+        return User(
+            id=99,
+            google_sub="sub-reviewer",
+            apple_sub=None,
+            email="my.app.store.reviewer@gmail.com",
+            name="App Store Reviewer",
+            picture_url=None,
+        )
+
+    @pytest.fixture
+    def reviewer_patched_app(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        reviewer_user: User,
+        fake_trips_store: dict[int, Trip],
+        fake_mutation_log: list[dict],
+        fake_backfill_kickoffs: list[tuple[int, str]],
+        fake_next_week_available: dict[str, bool],
+    ) -> Iterator[TestClient]:
+        # Set the env BEFORE the in-fixture `reset_settings_cache()`
+        # so the new Settings instance sees the reviewer email.
+        monkeypatch.setenv(
+            "REVIEW_ACCOUNT_EMAILS", "my.app.store.reviewer@gmail.com"
+        )
+        # Reuse the existing patched_app machinery by recursively
+        # asking pytest for it, with our overridden `logged_in_user`
+        # injected via dependency_overrides below.
+        from app.config import reset_settings_cache
+        from app.main import create_app
+
+        reset_settings_cache()
+
+        # Inline the same fakes the main `patched_app` uses. We
+        # deliberately don't refactor it into a helper here because the
+        # surface is small enough to duplicate and keeping fixture-vs-
+        # test responsibilities legible matters more than DRY.
+        def fake_list(user_id: int) -> list[Trip]:
+            return [t for t in fake_trips_store.values() if t.user_id == user_id]
+
+        def fake_get_by_slug(*, slug: str, user_id: int) -> Trip:
+            for trip in fake_trips_store.values():
+                if trip.slug == slug and trip.user_id == user_id:
+                    return trip
+            raise TripNotFoundError("not found")
+
+        next_id = {"value": 1}
+
+        def fake_create(
+            *,
+            user_id,
+            name,
+            origin_address,
+            destination_address,
+            per_user_cap,
+            total_cap,
+        ):
+            owned = [t for t in fake_trips_store.values() if t.user_id == user_id]
+            if len(owned) >= per_user_cap:
+                raise TripQuotaExceededError("per-user")
+            if len(fake_trips_store) >= total_cap:
+                raise TripQuotaExceededError("total")
+            new_id = next_id["value"]
+            trip = _make_trip(
+                id=new_id,
+                user_id=user_id,
+                name=name,
+                origin_address=origin_address,
+                destination_address=destination_address,
+                created_at=datetime(2025, 11, 1, 12, 0),
+            )
+            next_id["value"] += 1
+            fake_trips_store[trip.id] = trip
+            return trip
+
+        from app.services.trip_mutations import (
+            MutationQuota,
+            TripMutationQuotaExceededError,
+        )
+
+        def fake_assert_quota(user_id, settings):  # noqa: ARG001
+            used = sum(1 for r in fake_mutation_log if r["user_id"] == user_id)
+            limit = settings.max_trip_mutations_per_week
+            if used >= limit:
+                raise TripMutationQuotaExceededError(
+                    used=used, limit=limit, retry_after_seconds=3600
+                )
+
+        def fake_mutation_quota(user_id, settings):
+            used = sum(1 for r in fake_mutation_log if r["user_id"] == user_id)
+            return MutationQuota(
+                used=used,
+                limit=settings.max_trip_mutations_per_week,
+                oldest_age_seconds=None if used == 0 else 60,
+            )
+
+        def fake_record_mutation(*, user_id, trip_id, kind):
+            fake_mutation_log.append(
+                {"user_id": user_id, "trip_id": trip_id, "kind": kind}
+            )
+
+        def fake_sample_status(trip_id, week_start):  # noqa: ARG001
+            return {"total": 840, "ready": 210}
+
+        def fake_kickoff(trip_id: int, week_start) -> None:
+            fake_backfill_kickoffs.append((trip_id, week_start.isoformat()))
+
+        import app.api.trips_api as trips_api_mod
+
+        monkeypatch.setattr(trips_api_mod, "list_trips_for_user", fake_list)
+        monkeypatch.setattr(
+            trips_api_mod, "get_trip_for_user_by_slug", fake_get_by_slug
+        )
+        monkeypatch.setattr(trips_api_mod, "create_trip", fake_create)
+        monkeypatch.setattr(
+            trips_api_mod, "assert_mutation_quota", fake_assert_quota
+        )
+        monkeypatch.setattr(
+            trips_api_mod, "mutation_quota_for_user", fake_mutation_quota
+        )
+        monkeypatch.setattr(trips_api_mod, "record_mutation", fake_record_mutation)
+        monkeypatch.setattr(
+            trips_api_mod, "sample_status_for_trip", fake_sample_status
+        )
+        monkeypatch.setattr(trips_api_mod, "_kickoff_backfill", fake_kickoff)
+
+        app = create_app()
+        app.dependency_overrides[get_current_user] = lambda: reviewer_user
+        with TestClient(app) as c:
+            yield c
+
+    def test_reviewer_bypasses_geocoding_validator(
+        self,
+        reviewer_patched_app: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Install a validator that rejects every address. The reviewer
+        path must bypass it entirely and create the trip anyway."""
+        # `invalid` includes both addresses → if the stub is ever
+        # consulted, the request fails. The point of this test is to
+        # prove it's NOT consulted for a reviewer.
+        stub = _install_validator(
+            monkeypatch, invalid={"reviewer origin", "reviewer destination"}
+        )
+        r = reviewer_patched_app.post(
+            "/api/v1/trips",
+            json={
+                "name": "Reviewer Commute",
+                "origin_address": "reviewer origin",
+                "destination_address": "reviewer destination",
+            },
+        )
+        assert r.status_code == 201, r.text
+        assert stub.calls == [], (
+            "GoogleGeocodingValidator stub was consulted for a reviewer "
+            "account — the reviewer path should swap in NullAddressValidator "
+            "before reaching get_address_validator at all."
+        )
+
+    def test_non_reviewer_still_hits_validator(
+        self,
+        patched_app: TestClient,  # uses the normal `logged_in_user`
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Negative control: a normal user's create still pays the
+        Geocoding pre-flight (and gets rejected by a bad address).
+
+        Runs against the original `patched_app` (where `logged_in_user`
+        is `user@example.com`, not a reviewer) to prove the swap is
+        scoped to the reviewer email list and not a global no-op.
+        """
+        stub = _install_validator(monkeypatch, invalid={"reviewer origin"})
+        r = patched_app.post(
+            "/api/v1/trips",
+            json={
+                "name": "Real Commute",
+                "origin_address": "reviewer origin",
+                "destination_address": "200 Oak Ave",
+            },
+        )
+        assert r.status_code == 400
+        assert stub.calls == ["reviewer origin"]
+
+
 def test_patch_trip_skips_validation_when_addresses_unchanged(
     patched_app: TestClient,
     fake_trips_store: dict[int, Trip],
