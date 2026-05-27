@@ -237,15 +237,46 @@ async def list_my_trips(user: User = Depends(get_current_user)) -> list[TripOut]
     return [_trip_to_out(t) for t in list_trips_for_user(user.id)]
 
 
+# Effectively-unlimited cap surfaced to reviewer accounts. Picked to be
+# astronomically larger than any real per-user trip count or weekly
+# mutation count, while still fitting comfortably in MySQL `INT` and
+# JSON `number` round-trip without precision concerns. Chosen as a
+# constant (vs `sys.maxsize`) so the JSON serializes to a small number
+# the SPA can render in a "trips used" UI without scientific notation.
+_REVIEWER_UNLIMITED_CAP = 1_000_000
+
+
 def _trip_cap_for(user: User, settings: Settings) -> int:
-    """Per-user trip cap, with admins getting the elevated `max_trips_per_admin`.
+    """Per-user trip cap.
+
+    Tiers, in priority order:
+      1. Reviewer accounts: effectively unlimited (so App Review can
+         create / delete / re-create as many trips as the test plan
+         needs, without bumping into the prod 1-trip cap).
+      2. Admins: elevated `max_trips_per_admin` so the operator can
+         keep a personal trip alongside a smoke-test trip.
+      3. Everyone else: `max_trips_per_user`.
 
     Single source of truth so the cap shown to the SPA via /quota and
     the cap actually enforced by `create_trip` can never drift apart.
     """
+    if is_review_account(user, settings):
+        return _REVIEWER_UNLIMITED_CAP
     if is_admin(user, settings):
         return settings.max_trips_per_admin
     return settings.max_trips_per_user
+
+
+def _mutation_cap_for(user: User, settings: Settings) -> int:
+    """Rolling-7-day mutation cap for this user.
+
+    Reviewers get the same effectively-unlimited cap as for trip
+    count, so they can run the create / edit / swap / delete cycle
+    repeatedly without 429ing.
+    """
+    if is_review_account(user, settings):
+        return _REVIEWER_UNLIMITED_CAP
+    return settings.max_trip_mutations_per_week
 
 
 @trips_router.get("/quota", response_model=QuotaInfo)
@@ -253,13 +284,18 @@ async def get_my_quota(
     user: User = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ) -> QuotaInfo:
-    """Return slot usage *and* rolling-7-day mutation usage for the caller."""
+    """Return slot usage *and* rolling-7-day mutation usage for the caller.
+
+    Reviewer accounts see the effectively-unlimited cap surfaced via
+    `_mutation_cap_for`, so the SPA doesn't paint a "0 / 1 weekly
+    edits" badge that would confuse the App Review test plan.
+    """
     mq = mutation_quota_for_user(user.id, settings)
     return QuotaInfo(
         used=count_trips_for_user(user.id),
         limit=_trip_cap_for(user, settings),
         mutations_used=mq.used,
-        mutations_limit=mq.limit,
+        mutations_limit=_mutation_cap_for(user, settings),
         mutations_oldest_age_seconds=mq.oldest_age_seconds,
     )
 
@@ -297,11 +333,15 @@ async def create_my_trip(
         )
 
     # Weekly cost cap: refuse before we even pay for the Geocoding pre-flight
-    # so an abusive user can't drain the bill by hammering POST.
-    try:
-        assert_mutation_quota(user.id, settings)
-    except TripMutationQuotaExceededError as exc:
-        raise _raise_mutation_quota_429(exc) from exc
+    # so an abusive user can't drain the bill by hammering POST. Reviewer
+    # accounts bypass — they're already routed to FixtureProvider, so
+    # there's no per-mutation cost to ration, and the test plan requires
+    # repeated create/delete cycles in a single session.
+    if not is_review_account(user, settings):
+        try:
+            assert_mutation_quota(user.id, settings)
+        except TripMutationQuotaExceededError as exc:
+            raise _raise_mutation_quota_429(exc) from exc
 
     # Cheap Geocoding pre-flight so we don't burn ~840 Routes Matrix
     # calls on a garbage address. No-op in dev / with fixture provider,
@@ -416,7 +456,9 @@ async def update_my_trip(
         mutation_kind = "address_change"
 
     # Cap-check *before* paying for Geocoding when this patch is billed.
-    if will_change_addresses:
+    # Reviewer accounts bypass — no Routes Matrix spend downstream means
+    # no cost to ration, and the test plan exercises edit / swap freely.
+    if will_change_addresses and not is_review_account(user, settings):
         try:
             assert_mutation_quota(user.id, settings)
         except TripMutationQuotaExceededError as exc:

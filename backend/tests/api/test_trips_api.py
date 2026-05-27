@@ -637,18 +637,23 @@ def test_patch_trip_validates_only_changed_origin(
     assert stub.calls == ["junk"]
 
 
-class TestReviewAccountBypassesGeocoding:
-    """Reviewer accounts skip the Geocoding pre-flight.
+class TestReviewAccountCostGuards:
+    """Cost-control bypasses for App Store / Play Store reviewer accounts.
 
-    A reviewer is going to be typing test addresses ("address 1",
-    "home", "1234") during App Store review. With the prod
-    `GoogleGeocodingValidator`, those would all 400 with "couldn't
-    find that on Google Maps" — friction that doesn't apply to the
-    cost-protection goal (the downstream Routes Matrix backfill is
-    already FixtureProvider'd by `provider_for_user_email`).
+    Three surfaces fan out from `is_review_account`:
 
-    These tests prove the validator swap fires for reviewer emails
-    and that it doesn't accidentally fire for everyone else.
+      1. Geocoding pre-flight — swapped to NullAddressValidator so the
+         reviewer can type test addresses ("home", "1234") without
+         "couldn't find that on Google Maps" rejections.
+      2. Per-user trip cap — bumped to an effectively-unlimited value
+         (`_REVIEWER_UNLIMITED_CAP`) so the create/delete loop the
+         test plan exercises doesn't bump into the prod 1-trip cap.
+      3. Rolling-7-day mutation quota — bypassed entirely so the
+         reviewer can run the create / edit / swap / delete cycle
+         repeatedly in one session.
+
+    All three are gated by the same email check so a single env-var
+    rotation (`REVIEW_ACCOUNT_EMAILS`) toggles every bypass together.
     """
 
     @pytest.fixture
@@ -727,12 +732,72 @@ class TestReviewAccountBypassesGeocoding:
             fake_trips_store[trip.id] = trip
             return trip
 
+        from app.services.trips import _UNSET
+
+        def fake_update(
+            *,
+            trip_id: int,
+            user_id: int,
+            name=_UNSET,
+            origin_address=None,
+            destination_address=None,
+        ):
+            trip = fake_trips_store.get(trip_id)
+            if not trip or trip.user_id != user_id:
+                raise TripNotFoundError("not found")
+            new_name = trip.name if name is _UNSET else name
+            new_origin = (
+                origin_address.strip()
+                if origin_address is not None
+                else trip.origin_address
+            )
+            new_destination = (
+                destination_address.strip()
+                if destination_address is not None
+                else trip.destination_address
+            )
+            if new_origin.lower() == new_destination.lower():
+                raise ValueError("same address")
+            addresses_changed = (
+                new_origin != trip.origin_address
+                or new_destination != trip.destination_address
+            )
+            updated = _make_trip(
+                id=trip.id,
+                slug=trip.slug,
+                user_id=trip.user_id,
+                name=new_name,
+                origin_address=new_origin,
+                destination_address=new_destination,
+                created_at=trip.created_at,
+            )
+            fake_trips_store[trip_id] = updated
+            return updated, addresses_changed
+
+        def fake_count(user_id: int) -> int:
+            return len(
+                [t for t in fake_trips_store.values() if t.user_id == user_id]
+            )
+
         from app.services.trip_mutations import (
             MutationQuota,
             TripMutationQuotaExceededError,
         )
 
+        # Pin the per-user prod cap of 1 so an "unlimited" assertion
+        # can't accidentally pass by being below the dev overlay of 100.
+        # The `_apply_local_dev_quotas` overlay only kicks in when the
+        # env var is unset; setting it explicitly opts out.
+        monkeypatch.setenv("MAX_TRIPS_PER_USER", "1")
+        monkeypatch.setenv("MAX_TRIP_MUTATIONS_PER_WEEK", "1")
+
+        # Counters so reviewer-bypass tests can assert that the real
+        # quota check was *not* even consulted for a reviewer.
+        assert_quota_calls: list[int] = []
+        record_mutation_calls: list[dict] = []
+
         def fake_assert_quota(user_id, settings):  # noqa: ARG001
+            assert_quota_calls.append(user_id)
             used = sum(1 for r in fake_mutation_log if r["user_id"] == user_id)
             limit = settings.max_trip_mutations_per_week
             if used >= limit:
@@ -749,6 +814,9 @@ class TestReviewAccountBypassesGeocoding:
             )
 
         def fake_record_mutation(*, user_id, trip_id, kind):
+            record_mutation_calls.append(
+                {"user_id": user_id, "trip_id": trip_id, "kind": kind}
+            )
             fake_mutation_log.append(
                 {"user_id": user_id, "trip_id": trip_id, "kind": kind}
             )
@@ -759,6 +827,16 @@ class TestReviewAccountBypassesGeocoding:
         def fake_kickoff(trip_id: int, week_start) -> None:
             fake_backfill_kickoffs.append((trip_id, week_start.isoformat()))
 
+        # Expose the counters on the fixture object so tests can pull
+        # them from the TestClient (`c._reviewer_assert_quota_calls`).
+        # Slightly unusual but keeps the test signatures clean — adding
+        # a separate `reviewer_quota_counters` fixture for two ints
+        # would be more ceremony than the data warrants.
+        self._counters = {
+            "assert_quota": assert_quota_calls,
+            "record_mutation": record_mutation_calls,
+        }
+
         import app.api.trips_api as trips_api_mod
 
         monkeypatch.setattr(trips_api_mod, "list_trips_for_user", fake_list)
@@ -766,6 +844,8 @@ class TestReviewAccountBypassesGeocoding:
             trips_api_mod, "get_trip_for_user_by_slug", fake_get_by_slug
         )
         monkeypatch.setattr(trips_api_mod, "create_trip", fake_create)
+        monkeypatch.setattr(trips_api_mod, "update_trip", fake_update)
+        monkeypatch.setattr(trips_api_mod, "count_trips_for_user", fake_count)
         monkeypatch.setattr(
             trips_api_mod, "assert_mutation_quota", fake_assert_quota
         )
@@ -834,6 +914,143 @@ class TestReviewAccountBypassesGeocoding:
         )
         assert r.status_code == 400
         assert stub.calls == ["reviewer origin"]
+
+    def test_reviewer_quota_endpoint_reports_unlimited_caps(
+        self, reviewer_patched_app: TestClient
+    ) -> None:
+        """`/api/v1/trips/quota` should surface the bumped caps so the
+        SPA doesn't paint a "1 / 1 weekly edits" badge that would scare
+        the reviewer into thinking they're locked out."""
+        from app.api.trips_api import _REVIEWER_UNLIMITED_CAP
+
+        r = reviewer_patched_app.get("/api/v1/trips/quota")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["limit"] == _REVIEWER_UNLIMITED_CAP
+        assert body["mutations_limit"] == _REVIEWER_UNLIMITED_CAP
+
+    def test_non_reviewer_quota_endpoint_unchanged(
+        self, patched_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: a normal user's /quota still reports the
+        real prod caps from settings, not the reviewer-unlimited value.
+        Pins the env vars explicitly so the local-dev overlay doesn't
+        balloon them to 100."""
+        monkeypatch.setenv("MAX_TRIPS_PER_USER", "1")
+        monkeypatch.setenv("MAX_TRIP_MUTATIONS_PER_WEEK", "1")
+        from app.config import reset_settings_cache
+
+        reset_settings_cache()
+
+        r = patched_app.get("/api/v1/trips/quota")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["limit"] == 1
+        assert body["mutations_limit"] == 1
+
+    def test_reviewer_can_create_many_trips_in_a_row(
+        self, reviewer_patched_app: TestClient
+    ) -> None:
+        """The reviewer test plan exercises the create / delete cycle
+        repeatedly. With `MAX_TRIPS_PER_USER=1` pinned in the fixture
+        and no review-account bypass, this would 409 on the second
+        request — proving the bypass actually moves the cap upward."""
+        for i in range(5):
+            r = reviewer_patched_app.post(
+                "/api/v1/trips",
+                json={
+                    "name": f"Trip {i}",
+                    "origin_address": f"origin-{i}",
+                    "destination_address": f"destination-{i}",
+                },
+            )
+            assert r.status_code == 201, (
+                f"create #{i + 1} returned {r.status_code}: {r.text}"
+            )
+
+    def test_reviewer_create_skips_mutation_quota_check_entirely(
+        self, reviewer_patched_app: TestClient
+    ) -> None:
+        """The bypass is short-circuit — the route doesn't even ask
+        `assert_mutation_quota`, so a quota service outage (or a bug
+        that 500s the quota path) can't accidentally lock a reviewer
+        out mid-session."""
+        for i in range(3):
+            r = reviewer_patched_app.post(
+                "/api/v1/trips",
+                json={
+                    "origin_address": f"o-{i}",
+                    "destination_address": f"d-{i}",
+                },
+            )
+            assert r.status_code == 201, r.text
+
+        assert self._counters["assert_quota"] == [], (
+            "assert_mutation_quota was called for a reviewer — "
+            "the bypass should short-circuit before reaching it."
+        )
+
+    def test_reviewer_can_edit_addresses_unlimited(
+        self,
+        reviewer_patched_app: TestClient,
+        fake_trips_store: dict[int, Trip],
+    ) -> None:
+        """Reviewer can run an unbounded number of address-changing
+        PATCHes. With `MAX_TRIP_MUTATIONS_PER_WEEK=1`, a normal user
+        would hit a 429 immediately after the first edit."""
+        fake_trips_store[1] = _make_trip(
+            id=1,
+            user_id=99,  # matches `reviewer_user.id`
+            name="x",
+            origin_address="A",
+            destination_address="B",
+            created_at=None,
+        )
+
+        for i in range(5):
+            r = reviewer_patched_app.patch(
+                "/api/v1/trips/slug-00001",
+                json={"origin_address": f"new-origin-{i}"},
+            )
+            assert r.status_code == 200, (
+                f"edit #{i + 1} returned {r.status_code}: {r.text}"
+            )
+
+        assert self._counters["assert_quota"] == [], (
+            "assert_mutation_quota was called during a reviewer edit — "
+            "the bypass should short-circuit before reaching it."
+        )
+
+    def test_non_reviewer_still_hits_mutation_quota(
+        self, patched_app: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative control: a regular user STILL hits 429 on the
+        second create with `MAX_TRIP_MUTATIONS_PER_WEEK=1`. Proves
+        the bypass is scoped to reviewer emails, not a global removal
+        of the quota check."""
+        monkeypatch.setenv("MAX_TRIPS_PER_USER", "10")
+        monkeypatch.setenv("MAX_TRIP_MUTATIONS_PER_WEEK", "1")
+        from app.config import reset_settings_cache
+
+        reset_settings_cache()
+
+        r1 = patched_app.post(
+            "/api/v1/trips",
+            json={
+                "origin_address": "origin-1",
+                "destination_address": "destination-1",
+            },
+        )
+        assert r1.status_code == 201, r1.text
+
+        r2 = patched_app.post(
+            "/api/v1/trips",
+            json={
+                "origin_address": "origin-2",
+                "destination_address": "destination-2",
+            },
+        )
+        assert r2.status_code == 429, r2.text
 
 
 def test_patch_trip_skips_validation_when_addresses_unchanged(

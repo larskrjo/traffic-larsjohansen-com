@@ -335,11 +335,21 @@ repeatedly, which would otherwise drain real API budget.
 
 **The mechanism:** the backend reads a `REVIEW_ACCOUNT_EMAILS`
 comma-separated env var (configured in `backend/docker-compose.yml`).
-Trips owned by any listed email are transparently routed to the
-deterministic `FixtureProvider` (no Google network calls, no spend)
-and skip the Geocoding pre-flight entirely. The reviewer sees the
-same UX as a real user — heatmap fills in, delete works, re-create
-works — but the operator pays $0 for the review session.
+For any listed email, the trips API transparently:
+
+1. Routes the Routes Matrix backfill to the deterministic
+   `FixtureProvider` — no Google network calls, no spend.
+2. Swaps the Geocoding pre-flight for a no-op validator so test
+   addresses like `"home"` / `"work"` aren't rejected.
+3. Bumps the per-user trip cap to effectively unlimited
+   (`_REVIEWER_UNLIMITED_CAP = 1,000,000`) so the test plan's
+   create-many / delete-many cycle never hits the prod 1-trip cap.
+4. Bypasses the rolling-7-day mutation quota so unlimited edits
+   and swaps don't 429 mid-session.
+
+The reviewer sees the same UX as a real user — heatmap fills in,
+delete works, re-create works, swap works — but the operator pays
+$0 for the review session.
 
 Edge behavior worth knowing:
 
