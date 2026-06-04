@@ -29,4 +29,10 @@ export const ROUTES = {
     trip: (id: string) => `/trips/${id}`,
     settings: "/settings",
     adminAllowlist: "/admin/allowlist",
+    // Public legal / contact pages. Both are required for App Store
+    // Connect submission (Support URL and Privacy Policy URL) and
+    // must resolve without authentication so App Review can verify
+    // them on a clean browser session.
+    support: "/support",
+    privacy: "/privacy",
 } as const;

@@ -7,7 +7,7 @@
  * ever seen by newcomers.
  */
 import { useRef, type ReactNode } from "react";
-import { Navigate, useSearchParams } from "react-router";
+import { Link as RouterLink, Navigate, useSearchParams } from "react-router";
 import {
     Avatar,
     Box,
@@ -492,6 +492,46 @@ export default function SplashPage() {
                         Sign in to get started
                     </Button>
                 </Box>
+            </Container>
+
+            {/* Footer: legal + contact discoverability. The Privacy
+                Policy and Support URLs are required by App Store
+                Connect; surfacing them here too means an anonymous
+                visitor (and Apple Review) can always find them
+                without typing the path manually. The links are
+                lightweight and intentionally separated from the
+                marketing CTAs above. */}
+            <Container maxWidth="lg" sx={{ pb: { xs: 4, md: 6 } }}>
+                <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    spacing={{ xs: 1.5, sm: 3 }}
+                    alignItems="center"
+                    justifyContent="center"
+                    sx={{
+                        pt: { xs: 3, md: 4 },
+                        borderTop: (t) => `1px solid ${t.palette.divider}`,
+                    }}
+                >
+                    <Typography variant="caption" color="text.secondary">
+                        © {new Date().getFullYear()} Time2Leave
+                    </Typography>
+                    <Button
+                        component={RouterLink}
+                        to={ROUTES.privacy}
+                        size="small"
+                        sx={{ textTransform: "none", color: "text.secondary" }}
+                    >
+                        Privacy
+                    </Button>
+                    <Button
+                        component={RouterLink}
+                        to={ROUTES.support}
+                        size="small"
+                        sx={{ textTransform: "none", color: "text.secondary" }}
+                    >
+                        Support
+                    </Button>
+                </Stack>
             </Container>
         </Box>
     );
